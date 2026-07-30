@@ -190,7 +190,10 @@ season. And 2025 is a single test season; the confidence interval on 0.292 with
 Working: ingestion for all sources, the bitemporal as-of layer (7 passing
 tests), the feature builder, and the backtest harness.
 
-Next: the CIFFC preparedness level as a feature (needs daily accumulation — the
-sitrep page only ever shows today, so that series has to be *built*); a second
-model for ignition risk on a spatial grid; FastAPI serving; and a Postgres
-serving layer once there is something to serve.
+Next: **see [NEXT_STEPS.md](NEXT_STEPS.md)** — prioritised work, the invariants
+not to break, and the gotchas already paid for. It is written to be picked up
+cold.
+
+The headline item is a spatially-blocked backtest: the current result holds out
+a season but never a region, so "learned fire behaviour" and "memorised Alberta"
+are not yet distinguishable.
