@@ -166,10 +166,45 @@ def test_spatial_backtest_runs_end_to_end(monkeypatch, tmp_path):
 
     assert res.mode.startswith("region blocked")
     assert res.pooled["n_test"] == sum(f.n_test for f in res.folds)
-    assert (tmp_path / "escalation_spatial_backtest.json").exists()
+    # The filename records which blocking mode ran, so the strict and pooled
+    # runs cannot overwrite each other.
+    assert (tmp_path / "escalation_spatial_backtest_region.json").exists()
     # Signal is behavioural in this fixture, so an out-of-region model should
     # still clear the base rate by a wide margin.
     assert res.pooled["pr_auc_model"] > 3 * res.pooled["pr_auc_prevalence"]
+
+
+# --- reproducibility --------------------------------------------------------
+
+
+def test_row_order_does_not_change_the_score():
+    """The bug this guards: adding an upstream join moved PR-AUC by ~0.03.
+
+    Row order is not a modelling choice, but LightGBM's row subsampling and
+    the calibration tie-break both read row positions. Before `_deterministic`
+    the same table in a different order scored anywhere from 0.258 to 0.296 on
+    the real data -- a spread wider than any feature effect being measured.
+    """
+    from sklearn.metrics import average_precision_score
+
+    df = _table(1500, seed=11)
+    train = df.filter(pl.col("fire_year") < 2025)
+    test = df.filter(pl.col("fire_year") == 2025)
+
+    scores = []
+    for seed in (0, 1, 2):
+        shuffled = train.sample(fraction=1.0, shuffle=True, seed=seed)
+        fit = escalation._fit_and_predict(shuffled, test)
+        scores.append(round(float(average_precision_score(fit["y_te"], fit["p"])), 10))
+
+    assert len(set(scores)) == 1, f"row order changed the score: {scores}"
+
+
+def test_deterministic_imposes_a_total_order():
+    df = _table(200, seed=5).sample(fraction=1.0, shuffle=True, seed=9)
+    a = escalation._deterministic(df)
+    b = escalation._deterministic(df.sample(fraction=1.0, shuffle=True, seed=4))
+    assert a["national_fire_id"].to_list() == b["national_fire_id"].to_list()
 
 
 # --- bootstrap --------------------------------------------------------------

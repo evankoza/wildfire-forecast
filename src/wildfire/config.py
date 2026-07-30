@@ -34,7 +34,8 @@ CWFIS_DOWNLOADS = "https://cwfis.cfs.nrcan.gc.ca/downloads"
 CWFIF_WFS = "https://geoserver.cwfif.nrcan.gc.ca/geoserver/wfs"
 OPENMETEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 FIRMS_AREA = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-CIFFC_SITREP = "https://ciffc.net/situation/"
+CIFFC_SITREP = "https://ciffc.net/situation/"          # rendered page (fallback)
+CIFFC_API = "https://api.ciffc.net/v1"                 # what the page itself calls
 
 # NASA FIRMS needs a free MAP_KEY. Everything else in this project works
 # without credentials -- FIRMS is the optional near-real-time / global leg.

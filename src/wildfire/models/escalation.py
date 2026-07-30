@@ -87,6 +87,23 @@ NUMERIC = [
     "month",
     "doy",
     "t0_hour",
+    # CIFFC situation report, as published before the decision instant. These
+    # are human judgements about how stretched suppression is -- the one class
+    # of covariate with no machine-feed equivalent.
+    "ciffc_national_pl",
+    "ciffc_agency_pl",
+    "ciffc_prep_hazard",
+    "ciffc_prep_current_load",
+    "ciffc_prep_expected_load",
+    "ciffc_prep_resource_levels",
+    "ciffc_prep_resource_availability",
+    "ciffc_occurrence_pred_lightning",
+    "ciffc_occurrence_pred_human",
+    # `ciffc_sitrep_lag_hours` is built and kept in the modelling table, but
+    # deliberately not a feature. It measures how stale the sitrep was, which
+    # is a property of the reporting calendar rather than of the fire, and it
+    # is the only CIFFC variant that scored *below* the no-CIFFC baseline
+    # (-0.007 PR-AUC). Useful as a diagnostic, not as evidence.
 ]
 
 # Features that encode *where* rather than *how a fire behaves*. Dropping them
@@ -283,6 +300,21 @@ def _bootstrap(
     }
 
 
+def _deterministic(df: pl.DataFrame) -> pl.DataFrame:
+    """Impose a total order on rows before anything reads their positions.
+
+    Row order is not a modelling choice, but three things silently depend on
+    it: LightGBM's row subsampling, the tie-break inside the calibration
+    split, and `argsort` itself. Left alone they make the score a function of
+    how the parquet happened to be laid out -- adding a join upstream reorders
+    rows and the headline number moves by ~0.03 PR-AUC with no change to the
+    data at all. `(t0, national_fire_id)` is a total order because fire ids
+    are unique, so the result is now reproducible across rebuilds.
+    """
+    keys = [c for c in ("t0", "national_fire_id") if c in df.columns]
+    return df.sort(keys) if keys else df
+
+
 def _fit_and_predict(
     train: pl.DataFrame,
     test: pl.DataFrame,
@@ -302,6 +334,8 @@ def _fit_and_predict(
     """
     import lightgbm as lgb
 
+    train, test = _deterministic(train), _deterministic(test)
+
     X_tr, levels = _feature_frame(train, drop=drop)
     X_te, _ = _feature_frame(test, categories=levels, drop=drop)
     y_tr = train[TARGET].to_numpy().astype(int)
@@ -313,7 +347,9 @@ def _fit_and_predict(
         )
 
     cat_cols = [c for c in CATEGORICAL if c in X_tr.columns]
-    order = np.argsort(train["t0"].to_numpy())
+    # Stable, so fires sharing a t0 keep the total order imposed above rather
+    # than whatever quicksort happens to do with them.
+    order = np.argsort(train["t0"].to_numpy(), kind="stable")
     split = int(len(order) * 0.75)
     fit_idx, cal_idx = order[:split], order[split:]
 
@@ -619,8 +655,13 @@ def spatial_backtest(
         trained_at=_now(),
     )
 
-    suffix = "_nogeo" if drop_geography else ""
-    out = config.MODELS / f"escalation_spatial_backtest{suffix}.json"
+    # Both blocking modes and both feature sets write here, so the filename
+    # has to say which run it was -- otherwise the strict run silently
+    # overwrites the pooled one and the README ends up quoting a mix.
+    tag = "_region_season" if test_years != train_years else "_region"
+    if drop_geography:
+        tag += "_nogeo"
+    out = config.MODELS / f"escalation_spatial_backtest{tag}.json"
     out.write_text(json.dumps({"spec": asdict(spec), "result": asdict(res)}, indent=2))
     log.info("spatial backtest written -> %s", out)
     return res

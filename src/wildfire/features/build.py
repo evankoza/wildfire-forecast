@@ -131,6 +131,78 @@ def hotspot_features(
     return pl.from_arrow(out)
 
 
+PREP_FEATURES = {
+    "national_preparedness_level": "ciffc_national_pl",
+    "agency_preparedness": "ciffc_agency_pl",
+    "prep_hazard": "ciffc_prep_hazard",
+    "prep_current_load": "ciffc_prep_current_load",
+    "prep_expected_load": "ciffc_prep_expected_load",
+    "prep_resource_levels": "ciffc_prep_resource_levels",
+    "prep_resource_availability": "ciffc_prep_resource_availability",
+    "occurrence_pred_lightning": "ciffc_occurrence_pred_lightning",
+    "occurrence_pred_human": "ciffc_occurrence_pred_human",
+}
+
+
+def preparedness_features(
+    fires: pl.DataFrame,
+    sitreps: pl.DataFrame,
+    *,
+    decision_hours: int = SPEC.decision_hours,
+) -> pl.DataFrame:
+    """CIFFC preparedness as it stood at decision time.
+
+    An as-of backward join on `published_at`: the most recent sitrep for that
+    fire's agency that had actually gone out by T0 + decision_hours.
+
+    Joining on `sitrep_date` instead would leak, and subtly. The report for
+    the 15th is published late *on* the 15th, so a fire first reported that
+    morning would pick up a judgement -- including an explicit forecast of
+    tomorrow's fire load -- made hours after the decision instant. Publication
+    time is carried through ingestion precisely so this join can be honest.
+
+    `ciffc_sitrep_lag_hours` is kept as a feature in its own right: a stale
+    sitrep is weaker evidence, and off-season fires have none at all.
+    """
+    if sitreps.is_empty() or fires.is_empty():
+        return pl.DataFrame({asof.FIRE_KEY: []})
+
+    left = (
+        fires.select(
+            asof.FIRE_KEY,
+            "agency_code",
+            (pl.col("t0") + pl.duration(hours=decision_hours)).alias("decision_at"),
+        )
+        .drop_nulls(["decision_at", "agency_code"])
+        .sort("decision_at")
+    )
+    right = (
+        sitreps.select(
+            "agency_code",
+            pl.col("published_at").cast(pl.Datetime("us")),
+            *[pl.col(src).alias(dst) for src, dst in PREP_FEATURES.items()],
+        )
+        .drop_nulls(["published_at", "agency_code"])
+        .sort("published_at")
+    )
+
+    joined = left.join_asof(
+        right,
+        left_on="decision_at",
+        right_on="published_at",
+        by="agency_code",
+        strategy="backward",
+    )
+
+    return joined.select(
+        asof.FIRE_KEY,
+        *PREP_FEATURES.values(),
+        (
+            (pl.col("decision_at") - pl.col("published_at")).dt.total_minutes() / 60.0
+        ).alias("ciffc_sitrep_lag_hours"),
+    )
+
+
 def weather_features(fires: pl.DataFrame, *, limit: int | None = None) -> pl.DataFrame:
     """Observed ERA5 weather from T0 to decision time, per fire.
 
@@ -203,6 +275,17 @@ def build(
                           decision_hours=spec.decision_hours)
     if hs.height:
         base = base.join(hs, on=asof.FIRE_KEY, how="left")
+
+    sitrep_path = config.CURATED / "ciffc_sitreps.parquet"
+    if sitrep_path.exists():
+        prep = preparedness_features(offsets, pl.read_parquet(sitrep_path),
+                                     decision_hours=spec.decision_hours)
+        if prep.height:
+            base = base.join(prep, on=asof.FIRE_KEY, how="left")
+            log.info("preparedness features joined for %s of %s fires",
+                     base["ciffc_national_pl"].drop_nulls().len(), base.height)
+    else:
+        log.info("no CIFFC sitreps ingested - preparedness features will be absent")
 
     if with_weather:
         wx = weather_features(offsets)

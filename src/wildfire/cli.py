@@ -231,9 +231,42 @@ def _spatial(df, agencies, test_years, min_positives, drop_geography, n_boot):
     console.print(rt)
 
 
+@app.command("ingest-ciffc")
+def ingest_ciffc(
+    years: list[int] = typer.Option(None, "--years", "-y"),
+    force: bool = typer.Option(False, "--force"),
+):
+    """Backfill the CIFFC preparedness series from the dated public API.
+
+    One request per published sitrep date; reports exist only for the fire
+    season, so a year costs ~140 requests and responses are cached verbatim.
+    """
+    from .sources import ciffc
+
+    df = ciffc.load_history(years or None, force=force)
+    console.print(
+        f"[green]{df.height:,}[/] agency-day rows across "
+        f"{df['agency_code'].n_unique()} agencies"
+    )
+
+    t = Table(title="CIFFC preparedness coverage", header_style="bold")
+    for c in ("year", "n_days", "n_rows", "mean_national_pl", "max_national_pl",
+              "mean_agency_pl"):
+        t.add_column(c, justify="right")
+    for r in ciffc.preparedness_coverage(df).iter_rows(named=True):
+        t.add_row(*(str(r[c]) for c in ("year", "n_days", "n_rows",
+                                        "mean_national_pl", "max_national_pl",
+                                        "mean_agency_pl")))
+    console.print(t)
+
+
 @app.command("scrape-ciffc")
 def scrape_ciffc():
-    """Render and parse today's CIFFC national situation report."""
+    """Render and parse today's sitrep page (fallback for `ingest-ciffc`).
+
+    The API path needs no browser and can backfill; this cannot. Kept for the
+    day the API changes shape.
+    """
     from .sources import ciffc
 
     try:
@@ -244,7 +277,8 @@ def scrape_ciffc():
     console.print(
         f"sitrep [bold]{snap['sitrep_date']}[/] "
         f"preparedness level [bold]{snap['preparedness_level']}[/], "
-        f"{len(snap['new_fires_by_agency'])} agency rows"
+        f"{len(snap['new_fires_by_agency'])} agency rows, "
+        f"{len(snap['agency_preparedness'])} APL rows"
     )
 
 
