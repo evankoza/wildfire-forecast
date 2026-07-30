@@ -1,0 +1,9 @@
+# Normalise line endings in the repository. Without this a Linux clone or an
+# `ubuntu-latest` CI run shows every file as wholly rewritten, which buries
+# real diffs. Windows working trees are unaffected -- checkout still converts.
+* text=auto eol=lf
+
+# Never touch these, on any platform.
+*.parquet binary
+*.joblib binary
+*.zip binary

@@ -5,6 +5,7 @@
     python -m wildfire diagnose
     python -m wildfire build
     python -m wildfire backtest --test-years 2026
+    python -m wildfire backtest --holdout-agency ALL     # region-blocked
     python -m wildfire scrape-ciffc
 """
 
@@ -103,21 +104,66 @@ def build(
     )
 
 
-@app.command("backtest")
-def backtest(test_years: list[int] = typer.Option(None, "--test-years")):
-    """Train on earlier seasons, evaluate on held-out ones."""
-    df = pl.read_parquet(config.CURATED / "modelling_table.parquet")
-    res = escalation.train_and_backtest(df, test_years=test_years or None)
+def _fmt_ci(ci: dict, key: str) -> str:
+    lo_hi = ci.get(key)
+    if not lo_hi:
+        return "-"
+    return f"[{lo_hi[0]:.3f}, {lo_hi[1]:.3f}]"
 
-    t = Table(title="Escalation backtest", header_style="bold")
+
+def _interval_header(ci: dict) -> str:
+    """Label the interval column with the percentiles actually used."""
+    pct = ci.get("percentiles")
+    return f"{pct[0]}-{pct[-1]} pctile" if pct else "interval"
+
+
+@app.command("backtest")
+def backtest(
+    test_years: list[int] = typer.Option(None, "--test-years"),
+    holdout_agency: list[str] = typer.Option(
+        None, "--holdout-agency", "-a",
+        help="hold out a REGION, not a season: repeat the flag per agency, "
+             "or pass ALL to sweep every agency with enough positives",
+    ),
+    min_positives: int = typer.Option(
+        10, "--min-positives", help="skip agency folds thinner than this"
+    ),
+    drop_geography: bool = typer.Option(
+        False, "--drop-geography",
+        help="refit without lat/lon/agency/region to see what actually transfers",
+    ),
+    n_boot: int = typer.Option(1000, "--bootstrap", help="0 to skip the interval"),
+):
+    """Train on earlier seasons (or other regions), evaluate on held-out ones."""
+    df = pl.read_parquet(config.CURATED / "modelling_table.parquet")
+
+    if holdout_agency:
+        agencies = None if [a.upper() for a in holdout_agency] == ["ALL"] else \
+            [a.upper() for a in holdout_agency]
+        _spatial(df, agencies, test_years, min_positives, drop_geography, n_boot)
+        return
+
+    res = escalation.train_and_backtest(
+        df, test_years=test_years or None, n_boot=n_boot
+    )
+
+    t = Table(title="Escalation backtest (season-blocked)", header_style="bold")
     t.add_column("metric"); t.add_column("value", justify="right")
+    t.add_column(_interval_header(res.ci), justify="right")
+
     d = asdict(res)
+    bootstrapped = {"pr_auc_model", "pr_auc_size_only"}  # CI keys match field names
     for k in ("train_years", "test_years", "n_train", "n_test",
               "positive_rate_train", "positive_rate_test",
               "pr_auc_model", "pr_auc_size_only", "pr_auc_prevalence",
               "lift_over_size_baseline", "roc_auc_model",
               "brier_model", "brier_uncalibrated", "brier_prevalence"):
-        t.add_row(k, str(d[k]))
+        t.add_row(k, str(d[k]), _fmt_ci(res.ci, k) if k in bootstrapped else "")
+    if res.ci.get("pr_auc_delta"):
+        t.add_row("[bold]model - size baseline[/]",
+                  str(round(res.pr_auc_model - res.pr_auc_size_only, 4)),
+                  _fmt_ci(res.ci, "pr_auc_delta"))
+        t.add_row("P(model > size baseline)", str(res.ci["p_model_beats_size"]), "")
     console.print(t)
 
     ft = Table(title="Top features", header_style="bold")
@@ -131,6 +177,57 @@ def backtest(test_years: list[int] = typer.Option(None, "--test-years")):
         rt.add_column(c, justify="right")
     for r in res.reliability:
         rt.add_row(str(r["bucket"]), str(r["n"]), str(r["mean_predicted"]), str(r["observed_rate"]))
+    console.print(rt)
+
+
+def _spatial(df, agencies, test_years, min_positives, drop_geography, n_boot):
+    """Leave-one-agency-out: does it work in country it has never seen?"""
+    res = escalation.spatial_backtest(
+        df,
+        agencies=agencies,
+        test_years=test_years or None,
+        min_test_positives=min_positives,
+        drop_geography=drop_geography,
+        n_boot=n_boot,
+    )
+
+    title = f"Leave-one-agency-out - {res.mode}"
+    if res.dropped_features:
+        title += f" - without {', '.join(res.dropped_features)}"
+    t = Table(title=title, header_style="bold")
+    for c in ("held out", "n_test", "pos", "PR-AUC",
+              _interval_header(res.pooled["ci"]), "size base", "lift", "P(beats)"):
+        t.add_column(c, justify="right" if c != "held out" else "left")
+    for f in res.folds:
+        colour = "green" if f.pr_auc_model > f.pr_auc_size_only else "red"
+        t.add_row(
+            f.holdout_agency, f"{f.n_test:,}", str(f.n_positives_test),
+            f"[{colour}]{f.pr_auc_model}[/]", _fmt_ci(f.ci, "pr_auc_model"),
+            str(f.pr_auc_size_only), str(f.lift_over_size_baseline),
+            str(f.ci.get("p_model_beats_size", "-")),
+        )
+    p = res.pooled
+    t.add_section()
+    t.add_row("[bold]POOLED[/]", f"{p['n_test']:,}", str(p["n_positives"]),
+              f"[bold]{p['pr_auc_model']}[/]", _fmt_ci(p["ci"], "pr_auc_model"),
+              str(p["pr_auc_size_only"]), str(p["lift_over_size_baseline"]),
+              str(p["ci"].get("p_model_beats_size", "-")))
+    console.print(t)
+
+    console.print(
+        f"train seasons {res.train_years} / test seasons {res.test_years} - "
+        f"{res.macro['folds_beating_baseline']}/{res.macro['n_folds']} folds beat "
+        f"the size-at-decision baseline, median lift {res.macro['median_lift']}x"
+    )
+    for s in res.skipped:
+        console.print(f"[yellow]skipped {s['agency']}: {s['reason']}[/]")
+
+    rt = Table(title="Calibration (pooled out-of-region)", header_style="bold")
+    for c in ("bucket", "n", "mean_predicted", "observed_rate"):
+        rt.add_column(c, justify="right")
+    for r in p["reliability"]:
+        rt.add_row(str(r["bucket"]), str(r["n"]), str(r["mean_predicted"]),
+                   str(r["observed_rate"]))
     console.print(rt)
 
 

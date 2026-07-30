@@ -1,8 +1,9 @@
 # Next steps / handoff
 
-Written 2026-07-30. This file is meant to be read cold — by a person or a fresh
-Claude Code instance with no memory of how the project got here. Read
-`README.md` first for what the project *is*; this file is what to *do next*.
+Written 2026-07-30, revised the same day after P1 and P2 landed. This file is
+meant to be read cold — by a person or a fresh Claude Code instance with no
+memory of how the project got here. Read `README.md` first for what the project
+*is*; this file is what to *do next*.
 
 ---
 
@@ -16,10 +17,11 @@ python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-7 tests should pass in under a second. They need no network and no data — they
-run on an in-memory bitemporal fixture. **If these fail, fix that before
-anything else**: they pin the point-in-time guarantee the whole project rests
-on.
+17 tests should pass in under ten seconds. They need no network and no data —
+they run on an in-memory bitemporal fixture and a synthetic modelling table.
+**If these fail, fix that before anything else**: they pin the point-in-time
+guarantee the whole project rests on (`test_asof.py`) and the integrity of the
+region block (`test_escalation.py`).
 
 `data/` is gitignored and holds ~640 MB. Nothing in it is precious; it all
 rebuilds from public endpoints in about five minutes:
@@ -40,6 +42,10 @@ rebuilds from public endpoints in about five minutes:
 .venv/Scripts/python.exe -m wildfire backtest --test-years 2025
 ```
 
+```bash
+.venv/Scripts/python.exe -m wildfire backtest --holdout-agency ALL
+```
+
 ### Baseline to reproduce
 
 If the numbers below have moved, something changed — find out what before
@@ -49,10 +55,16 @@ building on top of it.
 |---|---|
 | rows in modelling table | 21,503 (542 escalations, 2.52%) |
 | n_train / n_test | 12,097 / 5,664 |
-| PR-AUC model | 0.292 |
-| PR-AUC size-at-decision baseline | 0.176 |
-| PR-AUC prevalence | 0.021 |
+| PR-AUC model | 0.2924 (5–95%: 0.237–0.360) |
+| PR-AUC size-at-decision baseline | 0.1762 (5–95%: 0.141–0.227) |
+| PR-AUC prevalence | 0.0207 |
+| paired delta, model − baseline | +0.1162 (5–95%: 0.053–0.173) |
 | Brier model / prevalence | 0.0166 / 0.0203 |
+| pooled out-of-region PR-AUC (9 folds) | 0.2668 (5–95%: 0.240–0.300) |
+| pooled out-of-region, region+season blocked | 0.2760 (5–95%: 0.224–0.341) |
+
+The bootstrap is seeded (`seed=17` in `_bootstrap`), so intervals reproduce
+exactly, not just approximately.
 
 ---
 
@@ -71,33 +83,51 @@ building on top of it.
   when you add outcome columns.
 - **ERA5 must not be read past the decision time.** It is reanalysis, not a
   forecast. `openmeteo.fetch_window` takes an explicit `until` for this reason.
+- **The test frame's category levels come from the training frame.**
+  `_feature_frame(test, categories=levels)` pins them. Build a test matrix
+  without passing `categories` and pandas renumbers the codes per frame, so a
+  level missing from one side shifts every level after it — nothing raises, the
+  model just reads `BC` as `ON`. This is load-bearing for the region-blocked
+  backtest, where the held-out agency is absent from training *by design*, and
+  it is asserted in `tests/test_escalation.py`.
 
 ---
 
-## 3. Priority work
+## 3. Settled — do not redo these
 
-### P1 — Spatially-blocked backtest (highest value)
+### ✅ P1 — Spatially-blocked backtest. **It generalises.**
 
-The current result holds out a *season*, never a *region*, and `lat`, `lon` and
-`region_code` carry heavy feature gain. So we cannot currently distinguish
-"learned fire behaviour" from "memorised Alberta". This is the test that decides
-whether the model is worth anything.
+`backtest --holdout-agency ALL` runs leave-one-agency-out; add `--test-years`
+to block region *and* season at once. Full tables are in the README. The short
+version: pooled out-of-region PR-AUC **0.267 [0.240, 0.300]** against a 0.157
+within-fold baseline, 8 of 9 folds beating their baseline, and the doubly
+blocked run agreeing at 0.276 [0.224, 0.341]. Out-of-region calibration holds
+(top bucket 11.2% predicted / 11.6% observed). The season-blocked headline was
+not an artefact of memorised geography.
 
-Concretely: add `--holdout-agency` to `backtest`, run leave-one-agency-out over
-the agencies with enough positives (BC, AB, ON, QC, SK, MB), and report PR-AUC
-per fold against the size-at-decision baseline computed *within that fold*.
+Two things worth knowing before you build on it:
 
-Expect degradation. The question is how much, and whether the model still beats
-the baseline in a region it has never seen. If it does not, the honest next move
-is to drop raw `lat`/`lon` in favour of ecozone / fuel-regime features that
-transfer.
+- **The contingent next step is dead.** The plan was: if it fails, drop raw
+  `lat`/`lon` for ecozone features. `--drop-geography` tests that directly and
+  it goes the *wrong* way — pooled out-of-region PR-AUC falls 0.267 → 0.209.
+  Coordinates carry transferable fire-regime signal. Do not spend time
+  replacing them; if you want ecozone features, add them *alongside*.
+- **PC (Parks Canada) is the one losing fold**, and it is not a region — it is
+  federal parkland scattered nationwide. Treat it as a known non-result rather
+  than a bug to chase.
 
-### P2 — Confidence intervals on the headline number
+### ✅ P2 — Confidence intervals
 
-117 positives in the 2025 test set. PR-AUC 0.292 has a wide interval and it is
-currently reported as a bare point estimate, which overstates what we know.
-Bootstrap it (resample test fires with replacement, ~1000 draws, report the 5th
-and 95th percentiles) and put the interval in the README table.
+Every PR-AUC now ships a seeded 1,000-draw percentile bootstrap (5th/95th),
+including the *paired* model-minus-baseline difference on the same resample.
+That pairing is the point: the marginal intervals for model and baseline nearly
+touch, which reads as "indistinguishable", while the paired difference is
++0.116 [0.053, 0.173] and favours the model in 99.9% of draws. If you add a
+metric, bootstrap it the same way — `_bootstrap` in `models/escalation.py`.
+
+---
+
+## 4. Priority work
 
 ### P3 — CIFFC scraper: run it, and settle the backfill question
 
@@ -143,29 +173,38 @@ FWI + weather + fuel + lightning + distance to roads/settlement.
 This is a much bigger lift than it sounds — it needs a grid, negative sampling
 (~0.1% positive rate), and careful handling of the fact that **absence of a
 detection is not absence of fire** (satellite overpass timing, cloud cover).
-Do not start it until P1 has answered whether the simpler model generalises.
+P1 has now cleared the gate it was waiting on: the simpler model does
+generalise spatially, so this is unblocked. It is still the largest item here
+by a wide margin — do P3 and P4 first unless there is a specific reason not to.
 
 ---
 
-## 4. Smaller cleanups
+## 5. Smaller cleanups
 
-- **`.gitattributes`** — git warns LF→CRLF on every file. Harmless on Windows,
-  but a Linux clone or `ubuntu-latest` CI run will show spurious whole-file
-  diffs. Three lines fixes it (`* text=auto eol=lf`).
+- ~~**`.gitattributes`**~~ — done (`* text=auto eol=lf`, plus binary markers).
+- ~~**No CI**~~ — done: `.github/workflows/ci.yml` runs `pytest` on push and PR
+  against `ubuntu-latest` / Python 3.12. The suite needs no network or data.
+  It has never actually run on GitHub, because nothing has been pushed yet.
 - **Quarantine implausible `record_start`** — a handful of 2023 fires carry
   record timestamps from 2011. Currently trusted silently; they should be
-  filtered with a logged count in `cwfis_fires._normalise`.
+  filtered with a logged count in `cwfis_fires._normalise`. Note this changes
+  `data/curated/` and so may move the baseline table above: re-run both
+  backtests afterwards and record the delta rather than quietly replacing the
+  numbers.
 - **Test whether weather earns its cost** — `build --weather` is off by default
   (one HTTP request per fire-cell/date window). Run it on a subsample and check
   whether PR-AUC moves at all; the hotspot feed already carries FWI, so it may
   add nothing.
 - **`percent_contained` / `severity_nearest_dsr` are almost always `-1`** in the
   feed (nulled on ingest). Probably worth dropping from `NUMERIC` entirely.
-- **No CI.** A GitHub Actions job running `pytest` on push would be ~15 lines.
+- **`hs_estarea_sum` and `hs_bfc_mean` are declared in `NUMERIC` but never
+  built** — the season archives lack `estarea` and `bfc` (see §6), so those two
+  columns are absent from the modelling table and silently skipped by
+  `_feature_frame`. Harmless, but misleading to read.
 
 ---
 
-## 5. Gotchas already paid for
+## 6. Gotchas already paid for
 
 Things that cost time once. Do not rediscover them.
 

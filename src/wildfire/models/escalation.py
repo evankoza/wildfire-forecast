@@ -6,12 +6,22 @@ Evaluation choices worth defending:
   would put revisions of the same fire, and neighbouring fires burning in the
   same weather, on both sides of the divide and return a flattering number
   that means nothing operationally.
+* **Region-blocked split, as a second axis.** Holding out a season answers
+  "does it work next year"; it does not answer "did it just memorise
+  Alberta". `spatial_backtest` holds out an entire reporting agency, so the
+  test fires are in country the model has never seen. `lat`, `lon` and
+  `region_code` carry heavy gain, so this is the split that decides whether
+  the model learned fire behaviour or geography.
 * **PR-AUC over ROC-AUC.** Escalations are a small minority; ROC-AUC is
   dominated by the easy negatives and stays high even for a useless model.
 * **Two baselines, not zero.** Prevalence (predict the base rate) and
   size-at-decision alone. A gradient-booster that cannot beat "how big is it
   already" has learned nothing worth deploying, and that comparison is the
   first thing a reviewer should see.
+* **Intervals, not point estimates.** ~117 positives carry a wide interval.
+  Every PR-AUC here comes with a percentile bootstrap, and the model-vs-
+  baseline comparison is bootstrapped *paired* on the same resample, because
+  overlapping marginal intervals do not mean two scores are indistinguishable.
 * **Calibration is reported, not assumed.** These scores would be read as
   probabilities by anyone allocating crews, so Brier score and a reliability
   table are part of the result.
@@ -21,8 +31,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 
 import numpy as np
 import polars as pl
@@ -79,6 +89,12 @@ NUMERIC = [
     "t0_hour",
 ]
 
+# Features that encode *where* rather than *how a fire behaves*. Dropping them
+# is the natural follow-up if the region-blocked backtest shows the model is
+# leaning on geography: `spatial_backtest(..., drop_geography=True)` refits
+# without them so the two numbers are directly comparable.
+GEOGRAPHIC = ["lat", "lon", "agency_code", "region_code"]
+
 # Columns that encode the answer. Guarding explicitly because a leaked label
 # is the failure mode that looks like success.
 FORBIDDEN = {
@@ -91,6 +107,13 @@ FORBIDDEN = {
     "n_revisions",
     "fire_year",
 }
+
+N_BOOT = 1000
+PCTILES = (5, 95)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds") + "Z"
 
 
 @dataclass
@@ -112,21 +135,80 @@ class Result:
     top_features: list[tuple[str, float]]
     reliability: list[dict]
     trained_at: str
+    # Percentile bootstrap over the test fires; see `_bootstrap`.
+    ci: dict = field(default_factory=dict)
 
 
-def _feature_frame(df: pl.DataFrame):
+@dataclass
+class FoldResult:
+    """One leave-one-agency-out fold."""
+
+    holdout_agency: str
+    n_train: int
+    n_test: int
+    n_positives_test: int
+    positive_rate_train: float
+    positive_rate_test: float
+    pr_auc_model: float
+    pr_auc_size_only: float
+    pr_auc_prevalence: float
+    lift_over_size_baseline: float
+    roc_auc_model: float
+    brier_model: float
+    brier_prevalence: float
+    calibrated: bool
+    ci: dict
+
+
+@dataclass
+class SpatialResult:
+    mode: str
+    train_years: list[int]
+    test_years: list[int]
+    agencies: list[str]
+    skipped: list[dict]
+    folds: list[FoldResult]
+    pooled: dict
+    macro: dict
+    dropped_features: list[str]
+    trained_at: str
+
+
+def _feature_frame(df: pl.DataFrame, *, categories: dict | None = None,
+                   drop: list[str] | None = None):
+    """Feature matrix, plus the category levels it was built with.
+
+    `categories` pins a test frame to the *training* frame's category levels.
+    Without it pandas assigns integer codes per frame, so a level missing from
+    one side silently shifts every code after it -- and in a region-blocked
+    fold the held-out agency is absent from training by construction. Levels
+    unseen in training become NaN, which LightGBM handles as missing.
+    """
     import pandas as pd
 
-    cols = [c for c in NUMERIC + CATEGORICAL if c in df.columns]
+    excluded = set(drop or ())
+    cols = [c for c in NUMERIC + CATEGORICAL if c in df.columns and c not in excluded]
     leaked = FORBIDDEN & set(cols)
     if leaked:
         raise RuntimeError(f"label leakage: {leaked} must not be features")
 
     pdf = df.select(cols).to_pandas()
+    levels: dict[str, object] = {}
     for c in CATEGORICAL:
-        if c in pdf.columns:
+        if c not in pdf.columns:
+            continue
+        if categories is None:
             pdf[c] = pdf[c].astype("category")
-    return pdf
+        else:
+            # Mask levels the training frame never saw before constructing the
+            # categorical: they become missing, which is the truthful encoding
+            # of "no evidence" and is what LightGBM already knows how to route.
+            # Done explicitly because passing unknown values straight to
+            # `pd.Categorical(..., categories=...)` is deprecated in pandas 3.
+            known = pdf[c].isin(list(categories[c]))
+            pdf[c] = pd.Categorical(pdf[c].where(known), categories=categories[c])
+        levels[c] = pdf[c].cat.categories
+    return pdf, levels
 
 
 def _reliability(y: np.ndarray, p: np.ndarray, bins: int = 5) -> list[dict]:
@@ -149,18 +231,158 @@ def _reliability(y: np.ndarray, p: np.ndarray, bins: int = 5) -> list[dict]:
     return out
 
 
+def _bootstrap(
+    y: np.ndarray,
+    p_model: np.ndarray,
+    p_base: np.ndarray,
+    *,
+    n_boot: int = N_BOOT,
+    seed: int = 17,
+) -> dict:
+    """Percentile bootstrap of PR-AUC over the test fires.
+
+    Resamples *fires* with replacement, which is the right unit: the question
+    an interval answers here is "how much of this number is the particular
+    handful of escalations we happened to draw this season".
+
+    Model and baseline are scored on the *same* resample so their difference
+    can be bootstrapped paired. That matters: marginal intervals on two
+    correlated statistics routinely overlap while the paired difference is
+    comfortably away from zero, and reading overlap as "no difference" would
+    understate the result.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    model, base, delta = [], [], []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        yb = y[idx]
+        if yb.sum() == 0:  # AP is undefined with no positives; skip the draw
+            continue
+        m = float(average_precision_score(yb, p_model[idx]))
+        b = float(average_precision_score(yb, p_base[idx]))
+        model.append(m)
+        base.append(b)
+        delta.append(m - b)
+
+    if not model:
+        return {"n_boot": 0, "note": "no resample contained a positive"}
+
+    lo, hi = PCTILES
+
+    def pct(v):
+        return [round(float(np.percentile(v, lo)), 4), round(float(np.percentile(v, hi)), 4)]
+
+    return {
+        "n_boot": len(model),
+        "percentiles": list(PCTILES),
+        "pr_auc_model": pct(model),
+        "pr_auc_size_only": pct(base),
+        "pr_auc_delta": pct(delta),
+        "p_model_beats_size": round(float(np.mean(np.asarray(delta) > 0)), 3),
+    }
+
+
+def _fit_and_predict(
+    train: pl.DataFrame,
+    test: pl.DataFrame,
+    *,
+    drop: list[str] | None = None,
+    seed: int = 17,
+) -> dict:
+    """Fit unweighted, isotonic-calibrate on a temporal tail, score the test set.
+
+    `class_weight="balanced"` helps the trees split on a rare class but
+    destroys the probability scale -- it optimises ranking at the cost of
+    calibration, and these scores would be read as probabilities by anyone
+    deciding where to send a crew. So: fit unweighted on the earlier part of
+    the training window, then isotonic-calibrate on the later part. The
+    calibration slice is temporal, never random, for the same reason the outer
+    split is.
+    """
+    import lightgbm as lgb
+
+    X_tr, levels = _feature_frame(train, drop=drop)
+    X_te, _ = _feature_frame(test, categories=levels, drop=drop)
+    y_tr = train[TARGET].to_numpy().astype(int)
+    y_te = test[TARGET].to_numpy().astype(int)
+
+    if y_tr.sum() == 0 or y_te.sum() == 0:
+        raise RuntimeError(
+            f"no positive examples in a split (train={y_tr.sum()}, test={y_te.sum()})"
+        )
+
+    cat_cols = [c for c in CATEGORICAL if c in X_tr.columns]
+    order = np.argsort(train["t0"].to_numpy())
+    split = int(len(order) * 0.75)
+    fit_idx, cal_idx = order[:split], order[split:]
+
+    if y_tr[cal_idx].sum() < 10:
+        log.warning("calibration slice has %s positives; skipping calibration",
+                    int(y_tr[cal_idx].sum()))
+        fit_idx, cal_idx = order, None
+
+    base = lgb.LGBMClassifier(
+        n_estimators=400,
+        learning_rate=0.05,
+        num_leaves=31,
+        min_child_samples=30,
+        subsample=0.9,
+        subsample_freq=1,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        verbose=-1,
+        random_state=seed,
+    )
+    base.fit(X_tr.iloc[fit_idx], y_tr[fit_idx], categorical_feature=cat_cols)
+    p_raw = base.predict_proba(X_te)[:, 1]
+
+    calibrator = None
+    if cal_idx is not None:
+        from sklearn.isotonic import IsotonicRegression
+
+        # Fit the isotonic map on the base model's scores over the held-back
+        # later slice, then apply it to the test scores. Done explicitly rather
+        # than via CalibratedClassifierCV because that estimator's `prefit`
+        # mode has changed API twice, and the mechanism is three lines anyway.
+        p_cal_in = base.predict_proba(X_tr.iloc[cal_idx])[:, 1]
+        calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        calibrator.fit(p_cal_in, y_tr[cal_idx])
+        p = calibrator.predict(p_raw)
+    else:
+        p = p_raw
+
+    size_only = np.nan_to_num(
+        test["size_at_decision"].fill_null(0).to_numpy(), nan=0.0
+    ).astype(float)
+
+    return {
+        "model": {"base": base, "calibrator": calibrator},
+        "p": p,
+        "p_raw": p_raw,
+        "size_only": size_only,
+        "y_tr": y_tr,
+        "y_te": y_te,
+        "columns": list(X_tr.columns),
+        "importances": base.feature_importances_.astype(float),
+        "calibrated": calibrator is not None,
+    }
+
+
+def _years(df: pl.DataFrame) -> list[int]:
+    if "fire_year" not in df.columns:
+        raise RuntimeError("modelling table needs fire_year for the temporal split")
+    return sorted(y for y in df["fire_year"].unique().to_list() if y is not None)
+
+
 def train_and_backtest(
     df: pl.DataFrame,
     *,
     test_years: list[int] | None = None,
+    n_boot: int = N_BOOT,
     spec=SPEC,
 ) -> Result:
-    import lightgbm as lgb
-
-    if "fire_year" not in df.columns:
-        raise RuntimeError("modelling table needs fire_year for the temporal split")
-
-    years = sorted(y for y in df["fire_year"].unique().to_list() if y is not None)
+    years = _years(df)
     if len(years) < 2:
         raise RuntimeError(
             f"need at least two fire years to hold one out; got {years}. "
@@ -187,76 +409,18 @@ def train_and_backtest(
     if train.is_empty() or test.is_empty():
         raise RuntimeError(f"empty split: train={train.height} test={test.height}")
 
-    X_tr, X_te = _feature_frame(train), _feature_frame(test)
-    y_tr = train[TARGET].to_numpy().astype(int)
-    y_te = test[TARGET].to_numpy().astype(int)
+    fit = _fit_and_predict(train, test)
+    p, p_raw, y_tr, y_te = fit["p"], fit["p_raw"], fit["y_tr"], fit["y_te"]
 
-    if y_tr.sum() == 0 or y_te.sum() == 0:
-        raise RuntimeError(
-            f"no positive examples in a split (train={y_tr.sum()}, test={y_te.sum()}); "
-            f"threshold {spec.size_threshold_ha} ha may be too high for this data"
-        )
-
-    # Two-stage fit. `class_weight="balanced"` helps the trees split on a rare
-    # class but destroys the probability scale -- it optimises ranking at the
-    # cost of calibration, and these scores would be read as probabilities by
-    # anyone deciding where to send a crew. So: fit unweighted on the earlier
-    # part of the training window, then isotonic-calibrate on the later part.
-    # The calibration slice is temporal, never random, for the same reason the
-    # outer split is.
-    cat_cols = [c for c in CATEGORICAL if c in X_tr.columns]
-    order = np.argsort(train["t0"].to_numpy())
-    split = int(len(order) * 0.75)
-    fit_idx, cal_idx = order[:split], order[split:]
-
-    if y_tr[cal_idx].sum() < 10:
-        log.warning("calibration slice has %s positives; skipping calibration",
-                    int(y_tr[cal_idx].sum()))
-        fit_idx, cal_idx = order, None
-
-    base = lgb.LGBMClassifier(
-        n_estimators=400,
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=30,
-        subsample=0.9,
-        subsample_freq=1,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        verbose=-1,
-        random_state=17,
-    )
-    base.fit(X_tr.iloc[fit_idx], y_tr[fit_idx], categorical_feature=cat_cols)
-    p_raw = base.predict_proba(X_te)[:, 1]
-
-    calibrator = None
-    if cal_idx is not None:
-        from sklearn.isotonic import IsotonicRegression
-
-        # Fit the isotonic map on the base model's scores over the held-back
-        # later slice, then apply it to the test scores. Done explicitly rather
-        # than via CalibratedClassifierCV because that estimator's `prefit`
-        # mode has changed API twice, and the mechanism is three lines anyway.
-        p_cal_in = base.predict_proba(X_tr.iloc[cal_idx])[:, 1]
-        calibrator = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-        calibrator.fit(p_cal_in, y_tr[cal_idx])
-        p = calibrator.predict(p_raw)
-    else:
-        p = p_raw
-
-    model = {"base": base, "calibrator": calibrator}
-
-    # Baselines.
     prevalence = float(y_tr.mean())
     p_prev = np.full_like(p, prevalence, dtype=float)
-    size_only = np.nan_to_num(test["size_at_decision"].fill_null(0).to_numpy(), nan=0.0)
 
     pr_model = float(average_precision_score(y_te, p))
-    pr_size = float(average_precision_score(y_te, size_only))
+    pr_size = float(average_precision_score(y_te, fit["size_only"]))
     pr_prev = float(y_te.mean())  # AP of a constant predictor is the base rate
 
     imp = sorted(
-        zip(X_tr.columns, base.feature_importances_.astype(float)),
+        zip(fit["columns"], fit["importances"]),
         key=lambda t: t[1],
         reverse=True,
     )[:15]
@@ -278,7 +442,8 @@ def train_and_backtest(
         lift_over_size_baseline=round(pr_model / pr_size, 3) if pr_size > 0 else float("nan"),
         top_features=[(k, round(v, 1)) for k, v in imp],
         reliability=_reliability(y_te, p),
-        trained_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        trained_at=_now(),
+        ci=_bootstrap(y_te, p, fit["size_only"], n_boot=n_boot),
     )
 
     out = config.MODELS / "escalation_backtest.json"
@@ -286,6 +451,176 @@ def train_and_backtest(
 
     import joblib
 
-    joblib.dump(model, config.MODELS / "escalation_lgbm.joblib")
+    joblib.dump(fit["model"], config.MODELS / "escalation_lgbm.joblib")
     log.info("backtest written -> %s", out)
+    return res
+
+
+def spatial_backtest(
+    df: pl.DataFrame,
+    *,
+    agencies: list[str] | None = None,
+    test_years: list[int] | None = None,
+    min_test_positives: int = 10,
+    drop_geography: bool = False,
+    n_boot: int = N_BOOT,
+    spec=SPEC,
+) -> SpatialResult:
+    """Leave-one-agency-out: can it forecast fires in country it has never seen?
+
+    The season-blocked backtest holds out *when*, never *where*, so it cannot
+    separate "learned fire behaviour" from "memorised Alberta". Here each fold
+    trains with one reporting agency removed entirely and tests on that
+    agency's fires. `lat`, `lon`, `agency_code` and `region_code` are kept but
+    are worthless-to-misleading on the held-out region by construction -- the
+    held-out agency's category level is unseen in training and arrives as
+    missing, and its lat/lon box sits outside the training range. That is the
+    point of the test, not a flaw in it. Pass `drop_geography=True` to refit
+    without them and see what transfers.
+
+    Two blocking modes:
+
+    * `test_years=None` -- region-blocked only. Every season appears on both
+      sides of the split, so a fire in Saskatchewan and a fire in Manitoba
+      burning under the same synoptic ridge can land in train and test
+      respectively. That shared-weather confound is real and flatters the
+      result; the mode exists because it is the only one with enough positives
+      per fold to say anything at all.
+    * `test_years=[...]` -- region *and* season blocked. Strictly honest, and
+      thin: most agencies do not clear `min_test_positives` in a single
+      season. Folds that do not are skipped rather than reported as noise.
+    """
+    years = _years(df)
+    if test_years:
+        cutoff = min(test_years)
+        train_years = [y for y in years if y < cutoff]
+        if not train_years:
+            raise RuntimeError(f"no seasons before {cutoff} to train on; have {years}")
+        mode = "region+season blocked"
+    else:
+        train_years = test_years = years
+        mode = "region blocked (seasons shared)"
+
+    train_pool = df.filter(pl.col("fire_year").is_in(train_years))
+    test_pool = df.filter(pl.col("fire_year").is_in(test_years))
+
+    counts = (
+        test_pool.group_by("agency_code")
+        .agg(pl.len().alias("n"), pl.col(TARGET).sum().alias("pos"))
+        .sort("pos", descending=True)
+    )
+    available = {r["agency_code"]: r for r in counts.iter_rows(named=True)}
+
+    if agencies is None:
+        agencies = [a for a, r in available.items() if r["pos"] >= min_test_positives]
+    agencies = [a for a in agencies if a is not None]
+
+    drop = list(GEOGRAPHIC) if drop_geography else None
+
+    folds: list[FoldResult] = [];  skipped: list[dict] = []
+    pooled_y, pooled_p, pooled_size = [], [], []
+
+    for agency in agencies:
+        row = available.get(agency)
+        if row is None:
+            skipped.append({"agency": agency, "reason": "no test fires"})
+            continue
+        if row["pos"] < min_test_positives:
+            skipped.append({
+                "agency": agency, "n_test": row["n"], "positives": row["pos"],
+                "reason": f"fewer than {min_test_positives} positives",
+            })
+            continue
+
+        train = train_pool.filter(pl.col("agency_code") != agency)
+        test = test_pool.filter(pl.col("agency_code") == agency)
+
+        fit = _fit_and_predict(train, test, drop=drop)
+        p, y_te, y_tr = fit["p"], fit["y_te"], fit["y_tr"]
+        size_only = fit["size_only"]
+
+        pr_model = float(average_precision_score(y_te, p))
+        pr_size = float(average_precision_score(y_te, size_only))
+        prevalence = float(y_tr.mean())
+
+        folds.append(
+            FoldResult(
+                holdout_agency=agency,
+                n_train=train.height,
+                n_test=test.height,
+                n_positives_test=int(y_te.sum()),
+                positive_rate_train=round(prevalence, 4),
+                positive_rate_test=round(float(y_te.mean()), 4),
+                pr_auc_model=round(pr_model, 4),
+                pr_auc_size_only=round(pr_size, 4),
+                pr_auc_prevalence=round(float(y_te.mean()), 4),
+                lift_over_size_baseline=(
+                    round(pr_model / pr_size, 3) if pr_size > 0 else float("nan")
+                ),
+                roc_auc_model=round(float(roc_auc_score(y_te, p)), 4),
+                brier_model=round(float(brier_score_loss(y_te, p)), 4),
+                brier_prevalence=round(
+                    float(brier_score_loss(y_te, np.full_like(p, prevalence))), 4
+                ),
+                calibrated=fit["calibrated"],
+                ci=_bootstrap(y_te, p, size_only, n_boot=n_boot),
+            )
+        )
+        pooled_y.append(y_te); pooled_p.append(p); pooled_size.append(size_only)
+        log.info("fold %s: PR-AUC %.4f vs size baseline %.4f (n=%s, pos=%s)",
+                 agency, pr_model, pr_size, test.height, int(y_te.sum()))
+
+    if not folds:
+        raise RuntimeError(
+            "no agency cleared the positive threshold; lower --min-positives "
+            "or drop --test-years to pool seasons"
+        )
+
+    # Pooled: every fire scored by a model that never saw its region. Folds
+    # have different prevalences so this is not a plain average -- it is the
+    # single number for "how well does this work out-of-region", weighted by
+    # where the fires actually are.
+    y_all = np.concatenate(pooled_y)
+    p_all = np.concatenate(pooled_p)
+    s_all = np.concatenate(pooled_size)
+    pr_all = float(average_precision_score(y_all, p_all))
+    pr_all_size = float(average_precision_score(y_all, s_all))
+
+    pooled = {
+        "n_test": int(len(y_all)),
+        "n_positives": int(y_all.sum()),
+        "pr_auc_model": round(pr_all, 4),
+        "pr_auc_size_only": round(pr_all_size, 4),
+        "pr_auc_prevalence": round(float(y_all.mean()), 4),
+        "lift_over_size_baseline": round(pr_all / pr_all_size, 3) if pr_all_size > 0 else None,
+        "roc_auc_model": round(float(roc_auc_score(y_all, p_all)), 4),
+        "brier_model": round(float(brier_score_loss(y_all, p_all)), 4),
+        "ci": _bootstrap(y_all, p_all, s_all, n_boot=n_boot),
+        "reliability": _reliability(y_all, p_all),
+    }
+    macro = {
+        "pr_auc_model": round(float(np.mean([f.pr_auc_model for f in folds])), 4),
+        "pr_auc_size_only": round(float(np.mean([f.pr_auc_size_only for f in folds])), 4),
+        "median_lift": round(float(np.median([f.lift_over_size_baseline for f in folds])), 3),
+        "folds_beating_baseline": int(sum(f.pr_auc_model > f.pr_auc_size_only for f in folds)),
+        "n_folds": len(folds),
+    }
+
+    res = SpatialResult(
+        mode=mode,
+        train_years=train_years,
+        test_years=test_years,
+        agencies=[f.holdout_agency for f in folds],
+        skipped=skipped,
+        folds=folds,
+        pooled=pooled,
+        macro=macro,
+        dropped_features=list(drop or ()),
+        trained_at=_now(),
+    )
+
+    suffix = "_nogeo" if drop_geography else ""
+    out = config.MODELS / f"escalation_spatial_backtest{suffix}.json"
+    out.write_text(json.dumps({"spec": asdict(spec), "result": asdict(res)}, indent=2))
+    log.info("spatial backtest written -> %s", out)
     return res

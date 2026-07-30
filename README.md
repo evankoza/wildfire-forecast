@@ -10,7 +10,7 @@ Three legs, each load-bearing:
 |---|---|---|
 | **API / OGC services** | CWFIF national GeoServer (WFS), CWFIS download services, Open-Meteo ERA5, NASA FIRMS | dense signal: fire state, satellite detections, weather |
 | **Web scraping** | CIFFC national situation report | the only source of National Preparedness Level — a human judgement with no machine feed |
-| **ML** | LightGBM escalation classifier, season-blocked backtest | the actual question |
+| **ML** | LightGBM escalation classifier, season- and region-blocked backtests | the actual question |
 
 ---
 
@@ -133,14 +133,15 @@ Evaluation reports **three** numbers, not one: the model, a size-at-decision
 baseline, and prevalence. A booster that cannot beat "how big is it already"
 has learned nothing worth deploying.
 
-## First backtest (real numbers)
+## Season-blocked backtest (real numbers)
 
 Train 2023–2024, test 2025. 12,097 fires train / 5,664 test, 2.07% escalation
-rate in the test season.
+rate in the test season. Intervals are a 1,000-draw percentile bootstrap over
+the test fires, 5th–95th.
 
 | metric | model | size-at-decision baseline | prevalence |
 |---|---|---|---|
-| PR-AUC | **0.292** | 0.176 | 0.021 |
+| PR-AUC | **0.292** [0.237, 0.360] | 0.176 [0.141, 0.227] | 0.021 |
 | Brier | **0.0166** | — | 0.0203 |
 | ROC-AUC | 0.955 | — | 0.5 |
 
@@ -148,6 +149,13 @@ So: **1.66× the precision-recall of "how big is it already"**, and 14× the bas
 rate. ROC-AUC of 0.955 looks spectacular and mostly is not — with a 2%
 positive rate it is dominated by easy negatives, which is exactly why PR-AUC
 leads the table.
+
+The interval matters here. 117 positives is not many, and the two marginal
+intervals above nearly touch — which invites the wrong conclusion. The
+comparison that settles it is the *paired* one, model and baseline scored on
+the same resample: the difference is **+0.116 [0.053, 0.173]**, and the model
+wins in **99.9%** of draws. Overlapping marginal intervals on two correlated
+statistics are not evidence of a tie.
 
 Calibration mattered. The first version used `class_weight="balanced"`, scored
 PR-AUC 0.275, and had a Brier score *worse than predicting the base rate*
@@ -162,11 +170,77 @@ satellite saw it before the agency reported it, and how intense it was burning.
 That detection-lead signal is the satisfying one: fires that orbit sees well
 before the ground reports them behave differently.
 
-**Caveats on this result.** `lat`, `lon` and `doy` carry large gain, which is
-partly real (fire regimes are geographic and seasonal) and partly
-memorisation — this has not been tested on a held-out *region*, only a held-out
-season. And 2025 is a single test season; the confidence interval on 0.292 with
-117 positives is wide. Both are next steps, not conclusions.
+## Did it learn fire behaviour, or memorise Alberta?
+
+`lat`, `lon` and `region_code` carry large gain, and a season-blocked split
+cannot tell a geographic prior apart from a memorised one. So: hold out a
+*region*. Each fold drops one reporting agency from training entirely and
+tests on that agency's fires, with the size-at-decision baseline recomputed
+inside the fold.
+
+```bash
+python -m wildfire backtest --holdout-agency ALL
+```
+
+| held out | n_test | pos | PR-AUC | 5–95% | size baseline | lift |
+|---|---:|---:|---:|---|---:|---:|
+| BC | 6,191 | 118 | 0.218 | [0.170, 0.273] | 0.160 | 1.36× |
+| SK | 1,794 | 94 | 0.297 | [0.239, 0.365] | 0.247 | 1.21× |
+| QC | 2,212 | 93 | 0.284 | [0.224, 0.360] | 0.197 | 1.44× |
+| MB | 1,111 | 51 | 0.203 | [0.149, 0.289] | 0.115 | 1.77× |
+| NT | 685 | 46 | 0.194 | [0.126, 0.272] | 0.118 | 1.64× |
+| ON | 2,333 | 44 | 0.382 | [0.272, 0.495] | 0.194 | 1.97× |
+| AB | 4,103 | 38 | 0.231 | [0.141, 0.349] | 0.169 | 1.36× |
+| YT | 523 | 33 | 0.411 | [0.279, 0.547] | 0.133 | 3.10× |
+| PC | 339 | 14 | 0.285 | [0.142, 0.458] | 0.294 | 0.97× |
+| **pooled** | **19,291** | **531** | **0.267** | **[0.240, 0.300]** | 0.157 | **1.71×** |
+
+**It generalises.** Every fire above was scored by a model that had never seen
+its region, and out-of-region PR-AUC (0.267) lands within noise of the
+season-blocked headline (0.292). 8 of 9 folds beat their own baseline; pooled,
+the model wins 100% of bootstrap draws. Calibration survives the move too —
+the top out-of-region bucket predicts 11.2% against 11.6% observed.
+
+The one failure is instructive rather than worrying: **PC is Parks Canada**,
+which is not a region at all but federal parkland scattered across the whole
+country. Holding it out removes nothing the model can't find elsewhere, and it
+is the fold where "unseen region" is the least meaningful frame.
+
+Blocking *both* axes at once — train 2023–24 minus one agency, test that
+agency in 2025 — is the strictest split this data supports, and thin enough
+that only six agencies clear ten positives:
+
+```bash
+python -m wildfire backtest --holdout-agency ALL --test-years 2025
+```
+
+Pooled PR-AUC **0.276 [0.224, 0.341]** against a 0.185 baseline, 1.49× lift,
+beating the baseline in 99.7% of draws; 5 of 6 folds win. BC is the loser
+(0.61× lift) — in a quiet BC season with 13 escalations out of 1,353 fires,
+raw size-at-decision was unusually predictive on its own.
+
+### The follow-up that did not pan out
+
+The obvious next move, if the model were leaning on geography, is to drop raw
+`lat`/`lon` for transferable ecozone or fuel-regime features. That hypothesis
+is testable directly, and it is wrong:
+
+```bash
+python -m wildfire backtest --holdout-agency ALL --drop-geography
+```
+
+Removing `lat`, `lon`, `agency_code` and `region_code` **drops** pooled
+out-of-region PR-AUC from 0.267 to **0.209**, and takes two more folds below
+their baseline. So coordinates are not a memorisation crutch — latitude is
+carrying real, transferable fire-regime signal (a 60°N boreal fire behaves
+differently from a 49°N one regardless of who reports it), and a model denied
+it does worse in regions it has never seen, not better.
+
+**Caveat, stated plainly.** The nine-fold table blocks region but shares
+seasons: a Saskatchewan fire in train and a Manitoba fire in test can be
+burning under the same synoptic ridge, which flatters it. That confound is why
+the doubly-blocked run is reported alongside — it is the honest number, and it
+is thin. Both point the same way, which is the reason to believe either.
 
 ## Honest notes
 
@@ -187,13 +261,15 @@ season. And 2025 is a single test season; the confidence interval on 0.292 with
 
 ## Status
 
-Working: ingestion for all sources, the bitemporal as-of layer (7 passing
-tests), the feature builder, and the backtest harness.
+Working: ingestion for all sources, the bitemporal as-of layer, the feature
+builder, and the backtest harness — season-blocked, region-blocked, and both
+at once, all with bootstrap intervals. 17 tests, no network, no data, under
+ten seconds.
+
+Not yet run: the CIFFC scraper (`sources/ciffc.py` is written but has never
+touched the live page). Not yet built: the second model (ignition risk), and
+any kind of scoring endpoint for the current season.
 
 Next: **see [NEXT_STEPS.md](NEXT_STEPS.md)** — prioritised work, the invariants
 not to break, and the gotchas already paid for. It is written to be picked up
 cold.
-
-The headline item is a spatially-blocked backtest: the current result holds out
-a season but never a region, so "learned fire behaviour" and "memorised Alberta"
-are not yet distinguishable.

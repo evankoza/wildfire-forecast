@@ -1,0 +1,19 @@
+name: tests
+
+# The suite needs no network and no data -- it runs on in-memory bitemporal
+# and synthetic fixtures -- so it is safe to run on every push.
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -q
