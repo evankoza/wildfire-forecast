@@ -17,12 +17,13 @@ python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-24 tests should pass in under ten seconds. They need no network and no data —
+27 tests should pass in under ten seconds. They need no network and no data —
 they run on an in-memory bitemporal fixture and a synthetic modelling table.
 **If these fail, fix that before anything else**: they pin the point-in-time
 guarantee the whole project rests on (`test_asof.py`), the integrity of the
-region block and the row-order determinism (`test_escalation.py`), and the
-as-of preparedness join (`test_preparedness.py`).
+region block and the row-order determinism (`test_escalation.py`), the as-of
+preparedness join (`test_preparedness.py`), and the order-independence of the
+hotspot aggregation (`test_determinism.py`).
 
 `data/` is gitignored and holds ~640 MB. Nothing in it is precious; it all
 rebuilds from public endpoints in about five minutes:
@@ -60,27 +61,41 @@ building on top of it.
 |---|---|
 | rows in modelling table | 21,503 (542 escalations, 2.52%) |
 | n_train / n_test | 12,097 / 5,664 |
-| PR-AUC model | 0.2703 (5–95%: 0.221–0.329) |
+| PR-AUC model | 0.2641 (5–95%: 0.216–0.320) |
 | PR-AUC size-at-decision baseline | 0.1762 (5–95%: 0.141–0.228) |
 | PR-AUC prevalence | 0.0207 |
-| paired delta, model − baseline | +0.0941 (5–95%: 0.038–0.141) |
-| Brier model / prevalence | 0.0166 / 0.0203 |
-| pooled out-of-region PR-AUC (9 folds) | 0.2482 (5–95%: 0.221–0.280) |
-| pooled out-of-region, region+season blocked | 0.2434 (5–95%: 0.200–0.299) |
-| pooled out-of-region, no geography | 0.2229 (5–95%: 0.196–0.253) |
+| paired delta, model − baseline | +0.0879 (5–95%: 0.033–0.134) |
+| Brier model / prevalence | 0.0168 / 0.0203 |
+| pooled out-of-region PR-AUC (8 of 9 folds win) | 0.2718 (5–95%: 0.245–0.305) |
+| pooled out-of-region, region+season blocked | 0.2481 (5–95%: 0.204–0.304) |
+| pooled out-of-region, no geography | 0.2383 (5–95%: 0.214–0.268) |
 
 These are now genuinely reproducible — bit-for-bit, not approximately. Both
 the bootstrap (`seed=17`) and the fit are seeded, **and row order is pinned**.
 
-> ⚠️ **The earlier version of this table said 0.2924, and it was not
-> reproducible.** LightGBM's row subsampling and the calibration split's
-> tie-break both read row positions, so the same data in a different physical
-> order scored 0.258–0.296. Adding one upstream join was enough to move it,
-> which is how this was found. `_deterministic` in `models/escalation.py` now
-> sorts by `(t0, national_fire_id)` before anything reads a row position.
+> ⚠️ **This table has been wrong twice, for two independent reasons, and both
+> times the number looked perfectly plausible.**
+>
+> 1. *In the model* (said 0.2924). LightGBM's row subsampling and the
+>    calibration split's tie-break read row positions, so the same data in a
+>    different physical order scored 0.258–0.296. Fixed by `_deterministic`.
+> 2. *In the features* (said 0.2703). DuckDB's parallel `AVG` over float64 and
+>    its `MODE` tie-break both vary with reduction/scan order, worth ~0.008
+>    PR-AUC. Fixed by DECIMAL sums and an explicit `ROW_NUMBER()` tie-break in
+>    `hotspot_features`.
+>
+> **0.2641 is the first figure verified by building the modelling table twice
+> and diffing it column by column.** Do that after any pipeline change:
+>
+> ```bash
+> python -m wildfire build && cp data/curated/modelling_table.parquet /tmp/a.parquet && python -m wildfire build
+> ```
+>
+> and diff `/tmp/a.parquet` against the new one — null-aware, NaN == NaN.
 > **If you add a join to `build()` and the headline moves, that is a bug, not
-> a result** — `tests/test_escalation.py::test_row_order_does_not_change_the_score`
-> is there to catch it.
+> a result.** `tests/test_escalation.py::test_row_order_does_not_change_the_score`
+> and `tests/test_determinism.py` catch the two known causes; a third would
+> show up the same way.
 
 ---
 
@@ -111,6 +126,12 @@ the bootstrap (`seed=17`) and the fit are seeded, **and row order is pinned**.
   LightGBM's subsampling and the calibration tie-break both do. Remove it and
   the headline becomes a function of how the parquet was laid out. See the
   warning in §1.
+- **Aggregations must be order-independent, not just the model.** In
+  `hotspot_features`, sums accumulate in `DECIMAL(18,6)` and the dominant fuel
+  type is chosen by explicit `ROW_NUMBER()` ordering — never `AVG` over float64
+  or `MODE`, both of which vary with DuckDB's parallel reduction order. Verify
+  any new aggregate with `tests/test_determinism.py`, which re-runs the join on
+  shuffled input and demands identical output.
 
 ---
 
@@ -120,24 +141,27 @@ the bootstrap (`seed=17`) and the fit are seeded, **and row order is pinned**.
 
 `backtest --holdout-agency ALL` runs leave-one-agency-out; add `--test-years`
 to block region *and* season at once. Full tables are in the README. The short
-version: pooled out-of-region PR-AUC **0.248 [0.221, 0.280]** against a 0.157
-within-fold baseline, **all 9 folds** beating their baseline, and the doubly
-blocked run agreeing at 0.243 [0.200, 0.299]. Out-of-region calibration holds
-(top bucket 11.4% predicted / 11.6% observed). The season-blocked headline was
+version: pooled out-of-region PR-AUC **0.272 [0.245, 0.305]** against a 0.157
+within-fold baseline, **8 of 9 folds** beating their baseline, and the doubly
+blocked run agreeing at 0.248 [0.204, 0.304]. Out-of-region calibration holds
+(top bucket 10.3% predicted / 12.3% observed). The season-blocked headline was
 not an artefact of memorised geography.
 
 Two things worth knowing before you build on it:
 
 - **The contingent next step is dead.** The plan was: if it fails, drop raw
   `lat`/`lon` for ecozone features. `--drop-geography` tests that directly and
-  it goes the *wrong* way — pooled out-of-region PR-AUC falls 0.248 → 0.223,
-  paired difference **+0.025 [+0.004, +0.046]**, geography favoured in 98% of
-  draws. Real, if modest. Coordinates carry transferable fire-regime signal;
-  do not spend time replacing them. If you want ecozone features, add them
-  *alongside*.
-- **PC (Parks Canada) is the weakest fold** at 1.03× lift, and it is not a
-  region — it is federal parkland scattered nationwide. Treat it as a known
-  non-result rather than a bug to chase.
+  it goes the *wrong* way — pooled out-of-region PR-AUC falls 0.272 → 0.238
+  [0.214, 0.268]. Real, if modest. Coordinates carry transferable fire-regime
+  signal; do not spend time replacing them. If you want ecozone features, add
+  them *alongside*. (The paired bootstrap of that difference is queued for
+  re-running — see §5 — but the direction is not in doubt.)
+- **PC (Parks Canada) is the one fold that loses**, at 0.82× lift — it scores
+  0.242 where size-at-decision alone gets 0.294. It is also not a region: it is
+  federal parkland scattered nationwide, so "held-out region" barely applies,
+  and with 14 positives its interval spans the baseline. A known non-result,
+  not a bug to chase. (It read 1.03× before the determinism fix, which is a
+  useful reminder of how thin that fold is.)
 
 ### ✅ P2 — Confidence intervals
 
@@ -184,17 +208,32 @@ the per-agency APL table newly parsed.
 
 ---
 
+### ✅ P4 — Current-season scoring. **Done.**
+
+`wildfire fit-final` then `wildfire predict` ranks fires burning now. Three
+things about it are load-bearing:
+
+- **Features come from `assemble_features`**, the same function that builds the
+  training table. `build()` is now that function plus a label. A separate
+  serving path is the standard way a model that backtests well quietly starts
+  seeing a different distribution than it was fitted on.
+- **Category levels are restored from the fitted model**, not rebuilt from
+  today's data. Rebuilt levels renumber whenever an agency has no active
+  fires, and the model reads one agency as another — the same trap
+  `_feature_frame(categories=...)` guards in the region-blocked backtest.
+- **`predict` uses a different model than the backtest reports on.** The
+  backtest model is deliberately handicapped (trained on 2023–24 so 2025 can be
+  held out); `fit-final` refits on every labelled season. So the deployed
+  model's accuracy is *inferred* from the backtest, never directly measured.
+  That is the honest arrangement, but state it as such.
+
+2026 hotspots have no archive zip, so `ingest-hotspots -y 2026` falls back to
+daily files, now restricted to the fire season (April–October). Those files
+carry two columns the archives lack (`estarea`, `bfc`); ingestion intersects
+the schema across seasons so the feature set never depends on how a year
+happened to be fetched.
+
 ## 4. Priority work
-
-### P4 — Current-season scoring
-
-2026 hotspots have no archive zip yet, so `ingest-hotspots -y 2026` falls back
-to ~210 daily file requests (`_load_days_for_year`). It works but is slow and
-untested at that volume; consider restricting to fire-season months.
-
-Then add a `predict` command: load `data/models/escalation_lgbm.joblib`, pull
-currently-burning fires from `activefires.csv`, and score the ones within 24 h
-of first report. That is the first thing that looks like a product.
 
 ### P5 — The second model (ignition risk)
 
@@ -214,25 +253,31 @@ by a wide margin — do P3 and P4 first unless there is a specific reason not to
 ## 5. Smaller cleanups
 
 - ~~**`.gitattributes`**~~ — done (`* text=auto eol=lf`, plus binary markers).
-- ~~**No CI**~~ — done: `.github/workflows/ci.yml` runs `pytest` on push and PR
-  against `ubuntu-latest` / Python 3.12. The suite needs no network or data.
-  It has never actually run on GitHub, because nothing has been pushed yet.
+- ~~**No CI**~~ — done and **green on GitHub** (`.github/workflows/ci.yml`,
+  `ubuntu-latest` / Python 3.12, no network or data needed).
 - **Quarantine implausible `record_start`** — a handful of 2023 fires carry
   record timestamps from 2011. Currently trusted silently; they should be
   filtered with a logged count in `cwfis_fires._normalise`. Note this changes
   `data/curated/` and so may move the baseline table above: re-run both
   backtests afterwards and record the delta rather than quietly replacing the
   numbers.
+- **Re-run the CIFFC ablation** — the five-row table in the README predates the
+  feature-determinism fix, so its absolute PR-AUCs come from the pre-fix
+  pipeline. The measured effects are all far smaller than the ~0.008 the bug
+  could move, so the "no effect" conclusion stands, but the figures are stale.
+- **Re-run the paired geography bootstrap** — same reason. The point estimates
+  (0.272 with geography, 0.238 without) are post-fix; the paired interval
+  quoted in the README, +0.025 [+0.004, +0.046], is not.
 - **Test whether weather earns its cost** — `build --weather` is off by default
   (one HTTP request per fire-cell/date window). Run it on a subsample and check
   whether PR-AUC moves at all; the hotspot feed already carries FWI, so it may
   add nothing.
 - **`percent_contained` / `severity_nearest_dsr` are almost always `-1`** in the
   feed (nulled on ingest). Probably worth dropping from `NUMERIC` entirely.
-- **`hs_estarea_sum` and `hs_bfc_mean` are declared in `NUMERIC` but never
-  built** — the season archives lack `estarea` and `bfc` (see §6), so those two
-  columns are absent from the modelling table and silently skipped by
-  `_feature_frame`. Harmless, but misleading to read.
+- ~~**`hs_estarea_sum` and `hs_bfc_mean` declared but never built**~~ — removed
+  from `NUMERIC`. Those two columns are now dropped at ingest so that the
+  feature schema is identical whether a season came from an archive zip or the
+  daily files.
 
 ---
 
@@ -242,6 +287,25 @@ by a wide margin — do P3 and P4 first unless there is a specific reason not to
   §2; repeated here because it is the single most expensive thing in this
   file. If a metric shifts after a pipeline change that should not have
   touched the data, suspect ordering before suspecting the feature.
+- **And then it happened a second time, one layer down — in DuckDB.** Fixing
+  the row order in the *model* did not make the *features* reproducible.
+  DuckDB aggregates in parallel and reduces float64 partial sums in whatever
+  order threads finish; float addition is not associative, so `AVG` drifted in
+  its last bits between runs of the same query on the same data, and `MODE`
+  broke ties by scan order. About 35 of 21,500 fires had a feature cross a
+  split threshold, worth ~0.008 PR-AUC. Fixes, both in `hotspot_features`:
+  sums accumulate in `DECIMAL(18,6)` (associative, so reduction order cannot
+  matter — and unlike `SET threads TO 1`, which also works, it does not add
+  minutes to a rebuild), and the dominant fuel type comes from an explicit
+  `ROW_NUMBER() ... ORDER BY COUNT(*) DESC, fuel_group ASC`.
+  `tests/test_determinism.py` fails if either is reverted.
+
+  The general lesson is the one worth keeping: **"reproducible" has to be
+  measured, not asserted.** Build the artefact twice and diff it. Both bugs
+  were invisible until something that could not possibly have changed a number
+  appeared to change one — and the first version of that very check passed
+  vacuously, because the build had failed and it compared a stale file against
+  itself. Check exit codes in verification scripts.
 - **CIFFC has a public JSON API; do not write a scraper.**
   `api.ciffc.net/v1/sitrep?date=YYYY-MM-DD`, no credentials. The tell was that
   the rendered page issues *no* data XHR at all, which meant the numbers had

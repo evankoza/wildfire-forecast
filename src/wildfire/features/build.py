@@ -76,11 +76,38 @@ def hotspot_features(
     carried = [c for c in measures if c in available]
 
     select_cols = ", ".join(f"h.{c}" for c in carried)
-    aggs = [
-        f"{how.upper()}({col}) AS hs_{col}_{how}"
-        for col in carried
-        for how in measures[col]
-    ]
+
+    # Sums are accumulated in DECIMAL, not float64.
+    #
+    # DuckDB aggregates in parallel and reduces partial sums in whatever order
+    # the threads finish. Float addition is not associative, so a mean drifts
+    # in its last bits between runs of the same query on the same data. That
+    # is physically meaningless -- FWI to 1e-12 is noise -- but a gradient
+    # booster is not physical: a handful of values land the other side of a
+    # split threshold, and the headline PR-AUC moves by ~0.008 with no change
+    # to the data whatsoever.
+    #
+    # Decimal addition *is* associative, so the sum is identical regardless of
+    # reduction order, and the single trailing division is then deterministic
+    # too. Forcing `SET threads TO 1` also fixes it but costs several minutes
+    # on a full rebuild; this keeps the parallelism.
+    # MAX/MIN are order-independent already and left exact.
+    DEC = "DECIMAL(18,6)"
+
+    def _agg(col: str, how: str) -> str:
+        if how == "mean":
+            # SUM/COUNT rather than AVG: AVG promotes to double internally,
+            # which is the thing being avoided. COUNT(col) skips nulls, so
+            # this matches AVG's semantics exactly.
+            expr = (f"CAST(SUM(CAST({col} AS {DEC})) AS DOUBLE) "
+                    f"/ NULLIF(COUNT({col}), 0)")
+        elif how == "sum":
+            expr = f"CAST(SUM(CAST({col} AS {DEC})) AS DOUBLE)"
+        else:
+            expr = f"{how.upper()}({col})"
+        return f"{expr} AS hs_{col}_{how}"
+
+    aggs = [_agg(col, how) for col in carried for how in measures[col]]
     agg_sql = ",\n        ".join(aggs)
 
     con = duckdb.connect()
@@ -113,18 +140,40 @@ def hotspot_features(
          AND h.rep_date <= w.win_end
          AND h.lat BETWEEN w.lat - w.dlat AND w.lat + w.dlat
          AND h.lon BETWEEN w.lon - w.dlon AND w.lon + w.dlon
+    ),
+    in_radius AS (
+        SELECT * FROM matched WHERE dist_km <= {radius_km}
+    ),
+    -- The dominant fuel type, with ties broken alphabetically rather than by
+    -- whichever row the scan happened to reach first. DuckDB's MODE() is
+    -- order-dependent on ties, which made this column silently non-reproducible.
+    fuel AS (
+        SELECT national_fire_id, fuel_group AS hs_fuel_group
+        FROM (
+            SELECT
+                national_fire_id,
+                fuel_group,
+                ROW_NUMBER() OVER (
+                    PARTITION BY national_fire_id
+                    ORDER BY COUNT(*) DESC, fuel_group ASC
+                ) AS rn
+            FROM in_radius
+            WHERE fuel_group IS NOT NULL
+            GROUP BY national_fire_id, fuel_group
+        )
+        WHERE rn = 1
     )
     SELECT
-        national_fire_id,
+        n.national_fire_id,
         COUNT(*)                                        AS hs_count,
         {agg_sql},
         MIN(dist_km)                                    AS hs_dist_min_km,
-        MODE(fuel_group)                                AS hs_fuel_group,
+        ANY_VALUE(f.hs_fuel_group)                      AS hs_fuel_group,
         COUNT(DISTINCT CAST(rep_date AS DATE))          AS hs_active_days,
-        DATE_DIFF('hour', MIN(rep_date), t0)            AS hs_detection_lead_hours
-    FROM matched
-    WHERE dist_km <= {radius_km}
-    GROUP BY national_fire_id, t0
+        DATE_DIFF('hour', MIN(rep_date), n.t0)          AS hs_detection_lead_hours
+    FROM in_radius n
+    LEFT JOIN fuel f USING (national_fire_id)
+    GROUP BY n.national_fire_id, n.t0
     """
     out = con.execute(sql).arrow()
     con.close()
@@ -234,42 +283,38 @@ def weather_features(fires: pl.DataFrame, *, limit: int | None = None) -> pl.Dat
     return pl.DataFrame(rows) if rows else pl.DataFrame({asof.FIRE_KEY: []})
 
 
-def build(
+def assemble_features(
     fires: pl.DataFrame,
+    offsets: pl.DataFrame,
     hotspots: pl.DataFrame,
     *,
     spec=SPEC,
-    data_cutoff: datetime | None = None,
     with_weather: bool = False,
 ) -> pl.DataFrame:
-    """The modelling table."""
-    offsets = asof.first_seen(fires)
+    """Everything known about each fire at T0 + decision_hours. No label.
 
-    if data_cutoff is None:
-        data_cutoff = fires["record_start"].max()
-    offsets = asof.observable(offsets, data_cutoff, spec.horizon_hours)
-    log.info("fires with an observable label horizon: %s", offsets.height)
-
+    Deliberately label-free so that `build` (training, where the horizon has
+    already passed) and `predict` (serving, where it has not) construct
+    features through *one* code path. Two paths would drift, and the model
+    would be scored at serving time on a feature distribution it was never
+    fitted on -- training/serving skew is the standard way a model that
+    backtests well fails in production.
+    """
     known = asof.state_asof(fires, offsets, spec.decision_hours)
     revs = asof.revisions_before(fires, offsets, spec.decision_hours)
-    labels = asof.label_at(fires, offsets, spec.horizon_hours)
 
-    base = (
-        offsets.join(
-            known.select(
-                asof.FIRE_KEY,
-                pl.col("fire_size").alias("size_at_decision"),
-                pl.col("stage_of_control_status").alias("status_at_decision"),
-                pl.col("response_type"),
-                pl.col("national_fire_cause"),
-                pl.col("percent_contained"),
-            ),
-            on=asof.FIRE_KEY,
-            how="inner",
-        )
-        .join(revs, on=asof.FIRE_KEY, how="left")
-        .join(labels, on=asof.FIRE_KEY, how="inner")
-    )
+    base = offsets.join(
+        known.select(
+            asof.FIRE_KEY,
+            pl.col("fire_size").alias("size_at_decision"),
+            pl.col("stage_of_control_status").alias("status_at_decision"),
+            pl.col("response_type"),
+            pl.col("national_fire_cause"),
+            pl.col("percent_contained"),
+        ),
+        on=asof.FIRE_KEY,
+        how="inner",
+    ).join(revs, on=asof.FIRE_KEY, how="left")
 
     hs = hotspot_features(offsets, hotspots, radius_km=spec.hotspot_radius_km,
                           decision_hours=spec.decision_hours)
@@ -292,7 +337,7 @@ def build(
         if wx.height:
             base = base.join(wx, on=asof.FIRE_KEY, how="left")
 
-    base = base.with_columns(
+    return base.with_columns(
         pl.col("t0").dt.month().alias("month"),
         pl.col("t0").dt.ordinal_day().alias("doy"),
         pl.col("t0").dt.hour().alias("t0_hour"),
@@ -301,6 +346,31 @@ def build(
         (pl.col("size_at_decision").fill_null(0) - pl.col("size_first").fill_null(0))
         .alias("size_growth_to_decision"),
         pl.col("size_at_decision").fill_null(0).log1p().alias("log_size_at_decision"),
+    )
+
+
+def build(
+    fires: pl.DataFrame,
+    hotspots: pl.DataFrame,
+    *,
+    spec=SPEC,
+    data_cutoff: datetime | None = None,
+    with_weather: bool = False,
+) -> pl.DataFrame:
+    """The modelling table: features as known at decision time, plus the label."""
+    offsets = asof.first_seen(fires)
+
+    if data_cutoff is None:
+        data_cutoff = fires["record_start"].max()
+    offsets = asof.observable(offsets, data_cutoff, spec.horizon_hours)
+    log.info("fires with an observable label horizon: %s", offsets.height)
+
+    base = assemble_features(fires, offsets, hotspots, spec=spec,
+                             with_weather=with_weather)
+    base = base.join(
+        asof.label_at(fires, offsets, spec.horizon_hours),
+        on=asof.FIRE_KEY,
+        how="inner",
     )
 
     # ---- label -----------------------------------------------------------

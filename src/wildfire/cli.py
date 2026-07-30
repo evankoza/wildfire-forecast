@@ -260,6 +260,86 @@ def ingest_ciffc(
     console.print(t)
 
 
+@app.command("fit-final")
+def fit_final():
+    """Refit on every labelled season, for scoring live fires.
+
+    Separate from `backtest` on purpose: the backtest model is handicapped so
+    a season can be held out honestly, and nothing should be *scored* with it.
+    """
+    df = pl.read_parquet(config.CURATED / "modelling_table.parquet")
+    payload = escalation.fit_final(df)
+    console.print(
+        f"final model: [green]{payload['n_train']:,}[/] fires, "
+        f"[bold]{payload['n_positives']}[/] escalations, seasons {payload['train_years']}"
+    )
+    console.print("[dim]accuracy for this model is inferred from the backtest, "
+                  "not measured on the rows it was fitted on[/]")
+
+
+@app.command("predict")
+def predict_cmd(
+    window_days: int = typer.Option(14, "--window-days",
+                                    help="how far back a first report can be"),
+    top: int = typer.Option(15, "--top"),
+    as_of: str = typer.Option(None, "--as-of", help="ISO timestamp; default = newest record"),
+):
+    """Rank fires burning now by probability of exceeding the size threshold."""
+    from datetime import datetime as _dt
+
+    from . import predict as predict_mod
+
+    stamp = _dt.fromisoformat(as_of) if as_of else None
+    df = predict_mod.score(as_of=stamp, window_days=window_days)
+    if df.is_empty():
+        console.print("[yellow]no fires in the scoring window[/]")
+        return
+
+    t = Table(title=f"Escalation risk - top {min(top, df.height)} of {df.height:,} fires",
+              header_style="bold")
+    for c, j in (("fire", "left"), ("age", "right"), ("ha @ decision", "right"),
+                 ("status @ decision", "left"), ("hotspots", "right"),
+                 ("risk", "right"), ("size now", "right")):
+        t.add_column(c, justify=j, overflow="fold")
+
+    for r in df.head(top).iter_rows(named=True):
+        risk = r["risk"]
+        colour = "red" if risk >= 0.25 else "yellow" if risk >= 0.10 else "white"
+        size_now = r.get("size_now")
+        # The national id is "<year>_<agency>_<agency's own id>"; the first two
+        # parts are constant down the column, so show the part that identifies
+        # the fire and put the agency in front of it.
+        fid = r["national_fire_id"] or ""
+        short = fid.split("_", 2)[-1] if fid.count("_") >= 2 else fid
+        t.add_row(
+            f"{r['agency_code'] or '--'}  {short}",
+            f"{r['age_hours'] // 24}d",
+            f"{(r['size_at_decision'] or 0):,.1f}",
+            predict_mod.STATUS_LABEL.get(r["status_at_decision"], r["status_at_decision"] or "-"),
+            str(int(r["hs_count"] or 0)),
+            f"[{colour}]{risk:.3f}[/]",
+            f"{size_now:,.0f}" if size_now is not None else "-",
+        )
+    console.print(t)
+    console.print(f"[dim]risk = P(>= {SPEC.size_threshold_ha:.0f} ha by T0+{SPEC.horizon_hours}h), "
+                  f"as known {SPEC.decision_hours}h after first report[/]")
+
+
+@app.command("report")
+def report(
+    outdir: str = typer.Option(None, "--outdir", help="default: docs/img/"),
+):
+    """Render the backtest as charts (light and dark, for the README)."""
+    from pathlib import Path
+
+    from . import report as report_mod
+
+    written = report_mod.generate(Path(outdir) if outdir else None)
+    console.print(f"[green]{len(written)}[/] figures -> {written[0].parent}")
+    for p in written:
+        console.print(f"  {p.name}", style="dim")
+
+
 @app.command("scrape-ciffc")
 def scrape_ciffc():
     """Render and parse today's sitrep page (fallback for `ingest-ciffc`).

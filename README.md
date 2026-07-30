@@ -148,45 +148,79 @@ the test fires, 5th–95th.
 
 | metric | model | size-at-decision baseline | prevalence |
 |---|---|---|---|
-| PR-AUC | **0.270** [0.221, 0.329] | 0.176 [0.141, 0.228] | 0.021 |
-| Brier | **0.0166** | — | 0.0203 |
-| ROC-AUC | 0.950 | — | 0.5 |
+| PR-AUC | **0.264** [0.216, 0.320] | 0.176 [0.141, 0.228] | 0.021 |
+| Brier | **0.0168** | — | 0.0203 |
+| ROC-AUC | 0.946 | — | 0.5 |
 
-So: **1.53× the precision-recall of "how big is it already"**, and 13× the base
-rate. ROC-AUC of 0.950 looks spectacular and mostly is not — with a 2%
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/pr-curve-dark.png">
+  <img alt="Precision-recall curve: the model sits above the size-at-decision baseline across the whole recall range, both far above the 0.021 prevalence line." src="docs/img/pr-curve-light.png" width="560">
+</picture>
+
+So: **1.50× the precision-recall of "how big is it already"**, and 13× the base
+rate. ROC-AUC of 0.946 looks spectacular and mostly is not — with a 2%
 positive rate it is dominated by easy negatives, which is exactly why PR-AUC
 leads the table.
 
 The interval matters here. 117 positives is not many, and the two marginal
 intervals above overlap — which invites the wrong conclusion. The comparison
 that settles it is the *paired* one, model and baseline scored on the same
-resample: the difference is **+0.094 [0.038, 0.141]**, and the model wins in
+resample: the difference is **+0.088 [0.033, 0.134]**, and the model wins in
 **99.8%** of draws. Overlapping marginal intervals on two correlated
 statistics are not evidence of a tie.
 
-> **This number used to read 0.292, and that was not reproducible.** Row order
-> is not a modelling choice, but LightGBM's row subsampling and the
-> calibration split's tie-break both read row positions, so the same data laid
-> out differently scored anywhere from 0.258 to 0.296 — a spread wider than
-> any feature effect this project has measured. Adding one upstream join was
-> enough to move it. `_deterministic` now imposes a total order on
-> `(t0, national_fire_id)` before anything reads a row position, and
-> `tests/test_escalation.py` fails if row order ever changes a score again.
-> 0.270 is the honest, reproducible figure; 0.292 was a lucky draw. Every
-> number on this page is post-fix.
+> **This number was not reproducible, twice, for two different reasons.**
+> Both were found the same way: something that could not possibly have changed
+> a number appeared to change one.
+>
+> *In the model.* LightGBM's row subsampling and the calibration split's
+> tie-break both read row positions, so the same data laid out differently
+> scored anywhere from 0.258 to 0.296 — a spread wider than any feature effect
+> this project has measured. `_deterministic` now imposes a total order on
+> `(t0, national_fire_id)` before anything reads a row position.
+>
+> *In the features, one layer down.* Fixing the model did not make the
+> pipeline reproducible. DuckDB aggregates in parallel and reduces float64
+> partial sums in whatever order threads finish; float addition is not
+> associative, so `AVG` drifted in its last bits between runs of the same
+> query on the same data, and `MODE` broke ties by scan order. About 35 of
+> 21,500 fires had a feature cross a split threshold — worth ~0.008 PR-AUC.
+> Sums now accumulate in `DECIMAL(18,6)`, which *is* associative, and the
+> dominant fuel type comes from an explicit `ROW_NUMBER()` ordering.
+>
+> `tests/test_determinism.py` re-runs the aggregation on shuffled input and
+> demands identical output; `tests/test_escalation.py` fails if row order ever
+> changes a score. **0.264 is the figure that survives building the table
+> twice and diffing it.** Every number on this page is post-fix.
 
-Calibration mattered. The first version used `class_weight="balanced"`, scored
-PR-AUC 0.275, and had a Brier score *worse than predicting the base rate*
-(0.0246 vs 0.0203) — its top bucket predicted 16.9% where 10.1% actually
-escalated. Refitting unweighted and isotonic-calibrating on a temporally
-held-back slice of the training window fixed both: top bucket now predicts
-14.3% against 11.1% observed.
+Calibration mattered. The first version used `class_weight="balanced"` and had
+a Brier score *worse than predicting the base rate* (0.0246 vs 0.0203) — its
+top bucket predicted 16.9% where 10.1% actually escalated. Refitting unweighted
+and isotonic-calibrating on a temporally held-back slice of the training window
+fixed it: Brier 0.0168 against the base rate's 0.0203, and the top bucket now
+predicts 13.4% against 11.0% observed.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/calibration-dark.png">
+  <img alt="Reliability diagram. Each dot is a score bucket, sized by how many fires it holds. The calibrated series tracks the diagonal; the uncalibrated one sits well off it." src="docs/img/calibration-light.png" width="480">
+</picture>
 
 Top features are dominated by `hs_dist_min_km`, `hs_detection_lead_hours` and
 `hs_hfi_max` — how close the nearest satellite detection is, how long the
 satellite saw it before the agency reported it, and how intense it was burning.
 That detection-lead signal is the satisfying one: fires that orbit sees well
 before the ground reports them behave differently.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/importance-dark.png">
+  <img alt="Feature importance by LightGBM split gain. Distance to the nearest satellite detection leads, ahead of latitude, longitude and day-of-year." src="docs/img/importance-light.png" width="600">
+</picture>
+
+Reproduce every figure above with:
+
+```bash
+python -m wildfire report
+```
 
 ## Did it learn fire behaviour, or memorise Alberta?
 
@@ -202,28 +236,35 @@ python -m wildfire backtest --holdout-agency ALL
 
 | held out | n_test | pos | PR-AUC | 5–95% | size baseline | lift |
 |---|---:|---:|---:|---|---:|---:|
-| BC | 6,191 | 118 | 0.189 | [0.148, 0.232] | 0.160 | 1.18× |
-| SK | 1,794 | 94 | 0.328 | [0.263, 0.402] | 0.247 | 1.33× |
-| QC | 2,212 | 93 | 0.275 | [0.214, 0.349] | 0.197 | 1.39× |
-| MB | 1,111 | 51 | 0.183 | [0.136, 0.250] | 0.115 | 1.59× |
-| NT | 685 | 46 | 0.209 | [0.134, 0.306] | 0.118 | 1.78× |
-| ON | 2,333 | 44 | 0.290 | [0.206, 0.400] | 0.194 | 1.50× |
-| AB | 4,103 | 38 | 0.235 | [0.146, 0.354] | 0.169 | 1.39× |
-| YT | 523 | 33 | 0.366 | [0.244, 0.509] | 0.133 | 2.76× |
-| PC | 339 | 14 | 0.302 | [0.162, 0.534] | 0.294 | 1.03× |
-| **pooled** | **19,291** | **531** | **0.248** | **[0.221, 0.280]** | 0.157 | **1.59×** |
+| ON | 2,333 | 44 | 0.438 | [0.322, 0.571] | 0.194 | 2.25× |
+| QC | 2,212 | 93 | 0.352 | [0.289, 0.437] | 0.197 | 1.78× |
+| SK | 1,794 | 94 | 0.344 | [0.283, 0.426] | 0.247 | 1.40× |
+| YT | 523 | 33 | 0.341 | [0.234, 0.483] | 0.133 | 2.57× |
+| NT | 685 | 46 | 0.308 | [0.224, 0.402] | 0.118 | 2.61× |
+| AB | 4,103 | 38 | 0.244 | [0.155, 0.371] | 0.169 | 1.44× |
+| PC | 339 | 14 | 0.242 | [0.142, 0.439] | 0.294 | **0.82×** |
+| BC | 6,191 | 118 | 0.209 | [0.168, 0.262] | 0.160 | 1.30× |
+| MB | 1,111 | 51 | 0.204 | [0.150, 0.273] | 0.115 | 1.78× |
+| **pooled** | **19,291** | **531** | **0.272** | **[0.245, 0.305]** | 0.157 | **1.74×** |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/regions-dark.png">
+  <img alt="Leave-one-agency-out results. Each row is a held-out agency showing model PR-AUC with a 5-95% bootstrap interval and its own within-fold size baseline; every fold's point estimate sits above its baseline." src="docs/img/regions-light.png" width="640">
+</picture>
 
 **It generalises.** Every fire above was scored by a model that had never seen
-its region, and out-of-region PR-AUC (0.248) lands within noise of the
-season-blocked headline (0.270). **All 9 folds** beat their own baseline;
+its region, and out-of-region PR-AUC (0.272) is, if anything, slightly above
+the season-blocked headline (0.264). **8 of 9 folds** beat their own baseline;
 pooled, the model wins 100% of bootstrap draws. Calibration survives the move
-too — the top out-of-region bucket predicts 11.4% against 11.6% observed.
+too — the top out-of-region bucket predicts 10.3% against 12.3% observed.
 
-The weakest fold is instructive rather than worrying: **PC is Parks Canada**,
-which is not a region at all but federal parkland scattered across the whole
-country. Holding it out removes nothing the model can't find elsewhere, and it
-is the fold where "unseen region" is the least meaningful frame — it scrapes
-past its baseline at 1.03×.
+The one fold that loses is **PC — Parks Canada**, at 0.82×. It is worth being
+clear that this is a genuine miss rather than a rounding artefact: the model
+scores 0.242 where size-at-decision alone gets 0.294. But PC is also not a
+region. It is federal parkland scattered across the entire country, so
+"hold out this region" is the least meaningful framing available, and with 14
+positives its interval [0.142, 0.439] spans the baseline comfortably. Treat it
+as a known non-result, not a bug to chase.
 
 Blocking *both* axes at once — train 2023–24 minus one agency, test that
 agency in 2025 — is the strictest split this data supports, and thin enough
@@ -233,10 +274,8 @@ that only six agencies clear ten positives:
 python -m wildfire backtest --holdout-agency ALL --test-years 2025
 ```
 
-Pooled PR-AUC **0.243 [0.200, 0.299]** against a 0.185 baseline, 1.32× lift,
-beating the baseline in 95.8% of draws; 5 of 6 folds win. BC is the loser
-(0.41× lift) — in a quiet BC season with 13 escalations out of 1,353 fires,
-raw size-at-decision was unusually predictive on its own.
+Pooled PR-AUC **0.248 [0.204, 0.304]** against a 0.185 baseline, 1.34× lift,
+beating the baseline in 97.4% of draws; 5 of 6 folds win, median lift 1.59×.
 
 ### The follow-up that did not pan out
 
@@ -249,10 +288,11 @@ python -m wildfire backtest --holdout-agency ALL --drop-geography
 ```
 
 Removing `lat`, `lon`, `agency_code` and `region_code` **drops** pooled
-out-of-region PR-AUC from 0.248 to **0.223**. Fitting both variants on
-identical folds and bootstrapping the difference paired gives **+0.025
-[+0.004, +0.046]**, favouring geography in 98% of draws — a real effect, and a
-modest one. So coordinates are not a memorisation crutch: latitude carries
+out-of-region PR-AUC from 0.272 to **0.238** [0.214, 0.268], a difference of
++0.034 — a real effect, and a modest one. (The earlier paired bootstrap of
+that difference, +0.025 [+0.004, +0.046], predates the determinism fix and has
+not been recomputed; the point estimates above have. See NEXT_STEPS.)
+So coordinates are not a memorisation crutch: latitude carries
 transferable fire-regime signal (a 60°N boreal fire behaves differently from a
 49°N one regardless of who reports it), and a model denied it does slightly
 worse in regions it has never seen, not better. Ecozone features are still
@@ -263,6 +303,53 @@ seasons: a Saskatchewan fire in train and a Manitoba fire in test can be
 burning under the same synoptic ridge, which flatters it. That confound is why
 the doubly-blocked run is reported alongside — it is the honest number, and it
 is thin. Both point the same way, which is the reason to believe either.
+
+## Scoring fires that are burning now
+
+The backtest answers "would this have worked". This answers "what should
+someone look at today":
+
+```bash
+python -m wildfire fit-final && python -m wildfire predict
+```
+
+```
+                          Escalation risk - top 10 of 1,032 fires
+┌──────────────────┬─────┬───────────────┬───────────────────┬──────────┬───────┬──────────┐
+│ fire             │ age │ ha @ decision │ status @ decision │ hotspots │  risk │ size now │
+├──────────────────┼─────┼───────────────┼───────────────────┼──────────┼───────┼──────────┤
+│ ON  SLK_FIRE_092 │ 15d │          60.0 │ out of control    │      300 │ 0.375 │    2,658 │
+│ BC  2026-N11027  │ 11d │          10.0 │ out of control    │      117 │ 0.300 │        2 │
+│ ON  NIP_FIRE_039 │ 16d │          50.0 │ out of control    │       25 │ 0.300 │       24 │
+│ BC  2026-G40991  │ 12d │           0.0 │ out of control    │        0 │ 0.242 │        0 │
+│ BC  2026-C40983  │ 12d │          30.0 │ out of control    │       14 │ 0.242 │   73,217 │
+└──────────────────┴─────┴───────────────┴───────────────────┴──────────┴───────┴──────────┘
+```
+
+`risk` is the score as it stood 24 h after each fire was first reported;
+`size now` is what that fire has since become, and is shown only as context —
+it is read at scoring time, long after the decision instant, and is not a
+feature.
+
+Three design points, because this is where a model that backtests well usually
+starts quietly failing:
+
+- **One feature path.** `predict` calls `assemble_features`, the same function
+  that builds the training table; `build()` is that function plus a label. A
+  separate serving path is the standard route to training/serving skew.
+- **Category levels come from the fitted model**, not from today's data. Rebuilt
+  levels renumber themselves whenever an agency happens to have no active
+  fires, and the model reads one agency as another.
+- **`predict` deliberately uses a different model than the one measured above.**
+  The backtest model is handicapped on purpose — trained on 2023–24 so 2025 can
+  be held out — and nothing should be *scored* with it. `fit-final` refits on
+  every labelled season. The consequence, stated plainly: the deployed model's
+  accuracy is **inferred** from the backtest, never directly observed.
+
+One honest wart: isotonic calibration is a step function, so the shipped score
+takes only ~26 distinct values and long ties appear (everything at 0.242
+above). That is fine for triage — it is a shortlist, not a ranking — but it
+means small differences between adjacent rows carry no information.
 
 ## The scraping leg that turned out not to be one
 
@@ -323,6 +410,13 @@ rows joined onto 98.5% of fires, and the effect on PR-AUC is nil:
 | national + agency PL only | 0.265 | −0.000 | [−0.020, +0.018] | 0.51 |
 | sitrep lag only | 0.258 | −0.007 | [−0.030, +0.016] | 0.31 |
 
+> This ablation predates the feature-determinism fix described above and has
+> not been re-run; its absolute PR-AUCs are drawn from the pre-fix pipeline
+> (which scored ~0.270 rather than 0.264). The differences are all far smaller
+> than the ~0.008 the bug could move, so the conclusion — no effect — is not
+> in question, but the individual figures are stale. Re-running it is a queued
+> item in NEXT_STEPS.
+
 Every interval straddles zero. The likely reason is structural rather than a
 data problem: preparedness varies by agency and by day, so every fire burning
 in one agency on one day gets the same value — and `doy`, `agency_code` and
@@ -361,13 +455,15 @@ day. The negative result here is about the task, not the data.
 ## Status
 
 Working: ingestion for all sources including the full CIFFC preparedness
-backfill, the bitemporal as-of layer, the feature builder, and the backtest
+backfill, the bitemporal as-of layer, the feature builder, the backtest
 harness — season-blocked, region-blocked, and both at once, all with bootstrap
-intervals and all reproducible bit-for-bit. 24 tests, no network, no data,
-under ten seconds.
+intervals — live scoring of currently-burning fires, and the figures on this
+page. Reproducible bit-for-bit, verified by building the modelling table twice
+and diffing it rather than by assertion. 27 tests, no network, no data, under
+ten seconds; CI runs them on every push.
 
-Not yet built: the second model (ignition risk), and any kind of scoring
-endpoint for the current season.
+Not yet built: the second model (ignition risk on a spatial grid), and any
+HTTP serving layer — `predict` is a CLI command writing parquet, not an API.
 
 Next: **see [NEXT_STEPS.md](NEXT_STEPS.md)** — prioritised work, the invariants
 not to break, and the gotchas already paid for. It is written to be picked up

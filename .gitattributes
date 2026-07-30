@@ -7,3 +7,4 @@
 *.parquet binary
 *.joblib binary
 *.zip binary
+*.png binary

@@ -74,11 +74,12 @@ NUMERIC = [
     "hs_fwi_mean",
     "hs_ros_max",
     "hs_ros_mean",
-    "hs_estarea_sum",
+    # `estarea` and `bfc` are deliberately absent: the season archives do not
+    # carry them, so they are dropped at ingest to keep the feature schema
+    # identical across seasons however they were fetched.
     "hs_sfc_mean",
     "hs_tfc_max",
     "hs_tfc_mean",
-    "hs_bfc_mean",
     "hs_dist_min_km",
     "hs_active_days",
     "hs_detection_lead_hours",
@@ -402,6 +403,17 @@ def _fit_and_predict(
         "columns": list(X_tr.columns),
         "importances": base.feature_importances_.astype(float),
         "calibrated": calibrator is not None,
+        # Needed to score anything later. Rebuilding a feature frame without
+        # these lets pandas assign category codes per frame, so a level absent
+        # at serving time shifts every code after it and the model silently
+        # reads one agency as another.
+        "levels": levels,
+        # The *reordered* frames. `_deterministic` runs on locals, so the
+        # caller's copies are still in their original order -- anything that
+        # lines a score vector up against a row must use these, not the frames
+        # it passed in, or every prediction is attached to the wrong fire.
+        "train_ordered": train,
+        "test_ordered": test,
     }
 
 
@@ -487,9 +499,78 @@ def train_and_backtest(
 
     import joblib
 
-    joblib.dump(fit["model"], config.MODELS / "escalation_lgbm.joblib")
+    joblib.dump(
+        {**fit["model"], "levels": fit["levels"], "columns": fit["columns"],
+         "train_years": train_years, "trained_at": res.trained_at},
+        config.MODELS / "escalation_lgbm.joblib",
+    )
+
+    # Persist the test-set scores. The bucketed `reliability` in the JSON is
+    # enough for a table, but a reliability *curve* and a PR curve need the raw
+    # vectors, and refitting just to draw them would be wasteful and would risk
+    # drawing a different model than the one reported. Aligned against
+    # `test_ordered`, not `test` -- see the note in `_fit_and_predict`.
+    ordered = fit["test_ordered"]
+    pl.DataFrame(
+        {
+            "national_fire_id": ordered["national_fire_id"],
+            "fire_year": ordered["fire_year"],
+            "agency_code": ordered["agency_code"],
+            "y": y_te,
+            "p": p,
+            "p_uncalibrated": p_raw,
+            "size_at_decision": fit["size_only"],
+        }
+    ).write_parquet(config.MODELS / "escalation_test_predictions.parquet")
+
     log.info("backtest written -> %s", out)
     return res
+
+
+def fit_final(df: pl.DataFrame, *, spec=SPEC, seed: int = 17) -> dict:
+    """Fit on every labelled season, for scoring fires that are burning now.
+
+    The backtest model is deliberately handicapped -- it is trained on
+    2023-24 so that 2025 can be held out honestly. Nothing should be *scored*
+    with it: by the time you are forecasting a live fire, last season is
+    history and withholding it is throwing away a third of the data for no
+    reason. So the reported numbers come from the backtest model and the
+    predictions come from this one, refit on the same pipeline.
+
+    The split between "the model I measured" and "the model I deploy" is the
+    honest arrangement, but it does mean the deployed model's accuracy is
+    *inferred* from the backtest rather than directly observed.
+    """
+    import joblib
+
+    labelled = df.filter(pl.col(TARGET).is_not_null())
+    if labelled.is_empty():
+        raise RuntimeError("no labelled rows to fit on")
+
+    years = _years(labelled)
+    ordered = _deterministic(labelled)
+
+    y = ordered[TARGET].to_numpy().astype(int)
+    if y.sum() < 20:
+        raise RuntimeError(f"only {y.sum()} positives; refusing to fit a final model")
+
+    fit = _fit_and_predict(ordered, ordered, seed=seed)
+    payload = {
+        **fit["model"],
+        "levels": fit["levels"],
+        "columns": fit["columns"],
+        "train_years": years,
+        "n_train": labelled.height,
+        "n_positives": int(y.sum()),
+        "spec": asdict(spec),
+        "trained_at": _now(),
+        "note": "fitted on all labelled seasons; accuracy is inferred from the "
+                "held-out backtest, not measured on these rows",
+    }
+    joblib.dump(payload, config.MODELS / "escalation_final.joblib")
+    log.info("final model fitted on %s (%s fires, %s positives)",
+             years, labelled.height, int(y.sum()))
+    return payload
 
 
 def spatial_backtest(

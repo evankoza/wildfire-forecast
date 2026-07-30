@@ -132,7 +132,24 @@ def load_seasons(years: list[int], *, force: bool = False) -> pl.DataFrame:
             log.warning("season %s archive unavailable (%s); trying daily files", y, exc)
             frames.append(_load_days_for_year(y))
 
-    df = pl.concat([f for f in frames if f is not None and f.height], how="vertical_relaxed")
+    frames = [f for f in frames if f is not None and f.height]
+    if not frames:
+        raise RuntimeError(f"no hotspot detections loaded for {years}")
+
+    # The rolling daily files carry two columns the season archives do not
+    # (`estarea`, `bfc`), so a naive concat raises on mismatched schemas -- and
+    # papering over that with a diagonal concat would be worse: the current
+    # season would contribute feature columns that are null for every training
+    # season, and the feature set would depend on which source a year happened
+    # to come from. Intersect instead, so the schema is the same no matter how
+    # a season was fetched.
+    common = set(frames[0].columns).intersection(*(set(f.columns) for f in frames[1:]))
+    ordered = [c for c in SCHEMA if c in common]
+    dropped = sorted(set().union(*(set(f.columns) for f in frames)) - common)
+    if dropped:
+        log.info("hotspot columns absent from at least one season, dropped: %s", dropped)
+
+    df = pl.concat([f.select(ordered) for f in frames], how="vertical_relaxed")
     df = drop_non_fuel(df)
     dest = config.CURATED / "hotspots.parquet"
     df.write_parquet(dest)
@@ -140,12 +157,22 @@ def load_seasons(years: list[int], *, force: bool = False) -> pl.DataFrame:
     return df
 
 
-def _load_days_for_year(year: int) -> pl.DataFrame:
-    """Fallback for the current season, which has no archive zip yet."""
+def _load_days_for_year(year: int, *, season_only: bool = True) -> pl.DataFrame:
+    """Fallback for the current season, which has no archive zip yet.
+
+    One request per day, so restricted to the fire season by default: outside
+    April-October the daily files are nearly empty and the whole point is to
+    avoid ~200 round trips for detections that do not exist.
+    """
+    from ..config import FIRE_SEASON_MONTHS
+
     frames = []
     d = date(year, 1, 1)
     end = min(date(year, 12, 31), date.today())
     while d <= end:
+        if season_only and d.month not in FIRE_SEASON_MONTHS:
+            d += timedelta(days=1)
+            continue
         got = fetch_day(d)
         if got is not None and got.height:
             frames.append(got)
