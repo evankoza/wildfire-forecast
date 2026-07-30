@@ -340,6 +340,19 @@ def report(
         console.print(f"  {p.name}", style="dim")
 
 
+@app.command("dashboard")
+def dashboard_cmd(
+    out: str = typer.Option(None, "--out", help="default: docs/dashboard.html"),
+):
+    """Build the self-contained HTML dashboard from the current artefacts."""
+    from pathlib import Path
+
+    from . import dashboard as dash
+
+    path = dash.build(out=Path(out) if out else None)
+    console.print(f"[green]{path}[/]  ({path.stat().st_size / 1024:.0f} KB, no external requests)")
+
+
 @app.command("scrape-ciffc")
 def scrape_ciffc():
     """Render and parse today's sitrep page (fallback for `ingest-ciffc`).

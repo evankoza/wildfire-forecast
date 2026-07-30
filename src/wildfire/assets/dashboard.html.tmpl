@@ -1,0 +1,650 @@
+<title>Wildfire Escalation Watch</title>
+
+<style>
+  /* ---- tokens -------------------------------------------------------- */
+  :root {
+    color-scheme: light;
+    /* Monospace is the display face here, not just the code face: this is an
+       operations readout and mono is its native voice. Declared once, outside
+       the theme swaps, because it never changes between themes. */
+    --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --ground:   #eef1f1;
+    --panel:    #ffffff;
+    --panel-2:  #f6f8f8;
+    --ink:      #0f1719;
+    --ink-2:    #47585c;
+    --ink-3:    #7a8b8f;
+    --rule:     #d3dcdc;
+    --rule-2:   #e6ecec;
+    --accent:   #1f7f78;
+    --accent-w: #d5eae8;
+    --sev-0:    #6d7f83;
+    --sev-1:    #b3741f;
+    --sev-2:    #c4432e;
+    --land:     #e3e9e8;
+    --land-ink: #c3cfcf;
+    --shadow:   0 1px 2px rgba(15,23,25,.06), 0 8px 24px rgba(15,23,25,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground:   #0d1214;
+      --panel:    #141c1f;
+      --panel-2:  #192327;
+      --ink:      #dde5e6;
+      --ink-2:    #9fb0b3;
+      --ink-3:    #71868a;
+      --rule:     #222e32;
+      --rule-2:   #1c262a;
+      --accent:   #3aa8a0;
+      --accent-w: #123330;
+      --sev-0:    #55686c;
+      --sev-1:    #c8842a;
+      --sev-2:    #d4523c;
+      --land:     #182124;
+      --land-ink: #2b393d;
+      --shadow:   0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:   #0d1214;
+    --panel:    #141c1f;
+    --panel-2:  #192327;
+    --ink:      #dde5e6;
+    --ink-2:    #9fb0b3;
+    --ink-3:    #71868a;
+    --rule:     #222e32;
+    --rule-2:   #1c262a;
+    --accent:   #3aa8a0;
+    --accent-w: #123330;
+    --sev-0:    #55686c;
+    --sev-1:    #c8842a;
+    --sev-2:    #d4523c;
+    --land:     #182124;
+    --land-ink: #2b393d;
+    --shadow:   0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.28);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 0 20px 72px; }
+
+  /* ---- masthead ------------------------------------------------------ */
+  .masthead {
+    display: flex; flex-wrap: wrap; align-items: flex-end; gap: 20px;
+    justify-content: space-between;
+    padding: 30px 0 18px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); display: block; margin-bottom: 8px;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(24px, 3.4vw, 36px);
+    font-weight: 600; letter-spacing: -.01em; margin: 0;
+    text-wrap: balance;
+  }
+  .asof {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-2);
+    text-align: right; line-height: 1.7;
+  }
+  .asof b { color: var(--ink); font-weight: 600; }
+
+  /* ---- advisory ------------------------------------------------------ */
+  .advisory {
+    margin-top: 18px; padding: 12px 16px;
+    border: 1px solid var(--rule); border-left: 3px solid var(--sev-1);
+    background: var(--panel-2); border-radius: 3px;
+    font-size: 13.5px; color: var(--ink-2);
+  }
+  .advisory b { color: var(--ink); }
+
+  /* ---- readouts ------------------------------------------------------ */
+  .readouts {
+    display: grid; gap: 1px; margin-top: 22px;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    background: var(--rule); border: 1px solid var(--rule); border-radius: 3px;
+    overflow: hidden;
+  }
+  .readout { background: var(--panel); padding: 14px 16px; }
+  .readout .k {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .readout .v {
+    font-family: var(--mono); font-size: 26px; font-weight: 600;
+    font-variant-numeric: tabular-nums; margin-top: 4px; line-height: 1.1;
+  }
+  .readout .s { font-size: 12px; color: var(--ink-2); margin-top: 2px; }
+  .v.sev2 { color: var(--sev-2); }
+  .v.sev1 { color: var(--sev-1); }
+
+  /* ---- console ------------------------------------------------------- */
+  .console {
+    display: grid; gap: 18px; margin-top: 18px;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    align-items: start;
+  }
+  @media (max-width: 940px) { .console { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 3px; box-shadow: var(--shadow);
+  }
+  .panel > header {
+    display: flex; flex-wrap: wrap; gap: 10px 14px;
+    align-items: center; justify-content: space-between;
+    padding: 11px 14px; border-bottom: 1px solid var(--rule-2);
+  }
+  .panel h2 {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-2); margin: 0; font-weight: 600;
+  }
+
+  /* ---- controls ------------------------------------------------------ */
+  .controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+    padding: 4px 9px; border: 1px solid var(--rule); border-radius: 2px;
+    background: transparent; color: var(--ink-2); cursor: pointer;
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .chip:hover { border-color: var(--accent); color: var(--ink); }
+  .chip[aria-pressed="true"] {
+    background: var(--accent-w); border-color: var(--accent); color: var(--ink);
+  }
+  .chip:focus-visible, select:focus-visible, th button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+  select {
+    font-family: var(--mono); font-size: 11px; padding: 4px 6px;
+    background: var(--panel); color: var(--ink);
+    border: 1px solid var(--rule); border-radius: 2px;
+  }
+
+  /* ---- map ----------------------------------------------------------- */
+  .mapwrap { position: relative; padding: 6px; }
+  svg.map { width: 100%; height: auto; display: block; }
+  .prov { fill: var(--land); stroke: var(--land-ink); stroke-width: .7; stroke-linejoin: round; }
+  .fire { stroke: var(--panel); stroke-width: .6; cursor: pointer; }
+  .fire.dim { opacity: .12; }
+  .fire.on { stroke: var(--ink); stroke-width: 1.4; }
+  .plabel {
+    font-family: var(--mono); font-size: 7.5px; letter-spacing: .1em;
+    fill: var(--ink-3); pointer-events: none; text-anchor: middle;
+  }
+  .tip {
+    position: absolute; pointer-events: none; z-index: 5;
+    background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 3px; box-shadow: var(--shadow);
+    padding: 8px 10px; font-family: var(--mono); font-size: 11.5px;
+    line-height: 1.6; min-width: 168px; opacity: 0; transition: opacity .1s;
+  }
+  .tip.show { opacity: 1; }
+  .tip .id { font-weight: 600; }
+  .tip .row { display: flex; justify-content: space-between; gap: 14px; color: var(--ink-2); }
+  .tip .row b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 9px 14px; border-top: 1px solid var(--rule-2);
+    font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+    letter-spacing: .05em;
+  }
+  .legend .sw { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+
+  /* ---- table --------------------------------------------------------- */
+  .tablewrap { max-height: 560px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--panel); border-bottom: 1px solid var(--rule);
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-3); font-weight: 600;
+    text-align: right; padding: 0;
+  }
+  thead th:first-child { text-align: left; }
+  thead th button {
+    all: unset; cursor: pointer; display: block; width: 100%;
+    padding: 9px 10px; box-sizing: border-box;
+  }
+  thead th[aria-sort] button { color: var(--ink); }
+  tbody td {
+    padding: 7px 10px; border-bottom: 1px solid var(--rule-2);
+    font-size: 12.5px; text-align: right; white-space: nowrap;
+  }
+  tbody td:first-child { text-align: left; font-family: var(--mono); font-size: 11.5px; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.on { background: var(--panel-2); }
+  .agency {
+    display: inline-block; min-width: 26px; color: var(--ink-3);
+    letter-spacing: .06em;
+  }
+  .risk { font-family: var(--mono); font-weight: 600; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; vertical-align: middle; }
+  .status {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .empty { padding: 28px 14px; text-align: center; color: var(--ink-3); font-size: 13px; }
+
+  /* ---- sections ------------------------------------------------------ */
+  section.block { margin-top: 40px; }
+  .block > h2 {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .13em;
+    text-transform: uppercase; color: var(--accent);
+    margin: 0 0 4px; font-weight: 600;
+  }
+  .block > .lede {
+    margin: 0 0 20px; color: var(--ink-2); font-size: 15px; max-width: 68ch;
+  }
+  .charts { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+  figure.chart { margin: 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 3px; padding: 10px; }
+  figure.chart img { width: 100%; height: auto; display: block; border-radius: 2px; }
+  figure.chart img.dk { display: none; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) figure.chart img.lt { display: none; }
+    :root:not([data-theme="light"]) figure.chart img.dk { display: block; }
+  }
+  :root[data-theme="dark"] figure.chart img.lt { display: none; }
+  :root[data-theme="dark"] figure.chart img.dk { display: block; }
+  :root[data-theme="light"] figure.chart img.lt { display: block; }
+  :root[data-theme="light"] figure.chart img.dk { display: none; }
+  figure.chart figcaption {
+    font-size: 12.5px; color: var(--ink-2); margin-top: 9px; padding: 0 2px;
+  }
+
+  .prose { max-width: 68ch; }
+  .prose p { margin: 0 0 14px; }
+  .prose h3 {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--ink); margin: 26px 0 8px; font-weight: 600;
+  }
+  .prose code {
+    font-family: var(--mono); font-size: .88em; background: var(--panel-2);
+    border: 1px solid var(--rule-2); border-radius: 2px; padding: 1px 5px;
+  }
+  .prose a { color: var(--accent); text-underline-offset: 3px; }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 18px; font-size: 13.5px; }
+  .kv dt { font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); padding-top: 3px; }
+  .kv dd { margin: 0; color: var(--ink-2); }
+
+  footer.foot {
+    margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--rule);
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-3);
+    display: flex; flex-wrap: wrap; gap: 8px 22px; justify-content: space-between;
+  }
+  footer.foot a { color: var(--ink-2); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div>
+      <span class="eyebrow">Canadian wildland fire &middot; escalation model</span>
+      <h1>Escalation Watch</h1>
+    </div>
+    <div class="asof">
+      scored as of <b id="asof-stamp"></b><br>
+      <span id="asof-note"></span>
+    </div>
+  </header>
+
+  <p class="advisory">
+    <b>Research model, not operational guidance.</b> These are the outputs of a
+    personal forecasting project built on public data. They are not endorsed by
+    any fire agency and must not be used for any operational or safety decision.
+    For real information, go to your provincial fire agency or the
+    <a href="https://cwfis.cfs.nrcan.gc.ca/interactive-map">CWFIS interactive map</a>.
+  </p>
+
+  <div class="readouts" id="readouts"></div>
+
+  <div class="console">
+    <div class="panel">
+      <header>
+        <h2>Where they are</h2>
+        <div class="controls">
+          <button class="chip" data-band="all" aria-pressed="true">All</button>
+          <button class="chip" data-band="elevated" aria-pressed="false">&ge;&thinsp;10%</button>
+          <button class="chip" data-band="high" aria-pressed="false">&ge;&thinsp;25%</button>
+          <select id="agency" aria-label="Filter by agency"></select>
+        </div>
+      </header>
+      <div class="mapwrap">
+        <svg class="map" id="map" role="img" aria-label="Map of Canada showing recently reported fires, coloured by modelled escalation risk"></svg>
+        <div class="tip" id="tip" role="status"></div>
+      </div>
+      <div class="legend">
+        <span class="sw"><i style="background:var(--sev-2)"></i> 25% and above</span>
+        <span class="sw"><i style="background:var(--sev-1)"></i> 10&ndash;25%</span>
+        <span class="sw"><i style="background:var(--sev-0)"></i> below 10%</span>
+        <span style="margin-left:auto">circle area &prop; hectares burned to date</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header>
+        <h2>Watchlist</h2>
+        <span class="asof" id="count"></span>
+      </header>
+      <div class="tablewrap">
+        <table id="tbl">
+          <thead>
+            <tr>
+              <th data-k="id"><button type="button">Fire</button></th>
+              <th data-k="risk" aria-sort="descending"><button type="button">Risk</button></th>
+              <th data-k="dec"><button type="button">ha at 24&thinsp;h</button></th>
+              <th data-k="now"><button type="button">ha now</button></th>
+              <th data-k="age"><button type="button">Age</button></th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div class="empty" id="empty" hidden>No fires match this filter.</div>
+      </div>
+    </div>
+  </div>
+
+  <section class="block">
+    <h2>Does it work</h2>
+    <p class="lede">
+      The model is scored the hard way: on seasons and regions it was never
+      trained on, always against the only baseline that matters &mdash; how big
+      the fire already is.
+    </p>
+    <div class="charts" id="charts"></div>
+  </section>
+
+  <section class="block">
+    <h2>How it works</h2>
+    <div class="prose" id="method"></div>
+  </section>
+
+  <footer class="foot">
+    <span id="foot-gen"></span>
+    <span>Fire data &middot; NRCan CWFIS / CWFIF &middot; boundaries &middot; Natural Earth</span>
+  </footer>
+</div>
+
+<script id="payload" type="application/json">__PAYLOAD__</script>
+<script>
+(function () {
+  "use strict";
+  var D = JSON.parse(document.getElementById("payload").textContent);
+  var $ = function (id) { return document.getElementById(id); };
+
+  var BANDS = [
+    { key: "high",     min: 0.25, css: "var(--sev-2)" },
+    { key: "elevated", min: 0.10, css: "var(--sev-1)" },
+    { key: "low",      min: -1,   css: "var(--sev-0)" }
+  ];
+  function bandOf(r) {
+    for (var i = 0; i < BANDS.length; i++) if (r >= BANDS[i].min) return BANDS[i];
+    return BANDS[2];
+  }
+  function fmt(n, d) {
+    // Escaped rather than literal: the page carries no charset declaration of
+    // its own, so any raw non-ASCII byte in the script is at the mercy of the
+    // host's Content-Type. Entities are safe in the markup; JS strings are not.
+    if (n === null || n === undefined) return "\u2014";
+    return n.toLocaleString("en-CA", { minimumFractionDigits: d || 0, maximumFractionDigits: d || 0 });
+  }
+
+  /* ---- Lambert conformal conic, the projection Canada is normally drawn in.
+     Standard parallels 49N / 77N, central meridian 95W. Equirectangular would
+     stretch Nunavut badly enough to misplace northern fires by eye. ------- */
+  var D2R = Math.PI / 180;
+  var P1 = 49 * D2R, P2 = 77 * D2R, P0 = 44 * D2R, L0 = -95 * D2R;
+  var N = Math.log(Math.cos(P1) / Math.cos(P2)) /
+          Math.log(Math.tan(Math.PI / 4 + P2 / 2) / Math.tan(Math.PI / 4 + P1 / 2));
+  var F = Math.cos(P1) * Math.pow(Math.tan(Math.PI / 4 + P1 / 2), N) / N;
+  var RHO0 = F / Math.pow(Math.tan(Math.PI / 4 + P0 / 2), N);
+  function project(lon, lat) {
+    var rho = F / Math.pow(Math.tan(Math.PI / 4 + lat * D2R / 2), N);
+    var th = N * (lon * D2R - L0);
+    return [rho * Math.sin(th), RHO0 - rho * Math.cos(th)];
+  }
+
+  /* ---- fit the projected geometry to a viewBox ------------------------ */
+  var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+  D.provinces.forEach(function (p) {
+    p.r.forEach(function (ring) {
+      ring.forEach(function (c) {
+        var q = project(c[0], c[1]);
+        if (q[0] < minX) minX = q[0];
+        if (q[0] > maxX) maxX = q[0];
+        if (q[1] < minY) minY = q[1];
+        if (q[1] > maxY) maxY = q[1];
+      });
+    });
+  });
+  var PAD = 0.02 * (maxX - minX);
+  var VW = (maxX - minX) + PAD * 2, VH = (maxY - minY) + PAD * 2;
+  function toView(lon, lat) {
+    var q = project(lon, lat);
+    return [q[0] - minX + PAD, q[1] - minY + PAD];
+  }
+
+  var svg = $("map"), NS = "http://www.w3.org/2000/svg";
+  svg.setAttribute("viewBox", "0 0 " + VW.toFixed(4) + " " + VH.toFixed(4));
+
+  var gLand = document.createElementNS(NS, "g");
+  D.provinces.forEach(function (p) {
+    var d = "";
+    p.r.forEach(function (ring) {
+      ring.forEach(function (c, i) {
+        var v = toView(c[0], c[1]);
+        d += (i ? "L" : "M") + v[0].toFixed(4) + " " + v[1].toFixed(4);
+      });
+      d += "Z";
+    });
+    var path = document.createElementNS(NS, "path");
+    path.setAttribute("d", d);
+    path.setAttribute("class", "prov");
+    gLand.appendChild(path);
+  });
+  svg.appendChild(gLand);
+
+  var gFire = document.createElementNS(NS, "g");
+  svg.appendChild(gFire);
+
+  /* Area-proportional radius, floored so a 0.1 ha fire is still clickable
+     and capped so one 73,000 ha fire does not swallow the map. */
+  var RMIN = VW * 0.0035, RMAX = VW * 0.019;
+  function radius(ha) {
+    var t = Math.sqrt(Math.min(Math.max(ha, 0), 20000) / 20000);
+    return RMIN + t * (RMAX - RMIN);
+  }
+
+  var nodes = D.fires.map(function (f) {
+    var v = toView(f.lon, f.lat);
+    var c = document.createElementNS(NS, "circle");
+    c.setAttribute("cx", v[0].toFixed(3));
+    c.setAttribute("cy", v[1].toFixed(3));
+    c.setAttribute("r", radius(f.now).toFixed(3));
+    c.setAttribute("fill", bandOf(f.risk).css);
+    c.setAttribute("class", "fire");
+    c.setAttribute("tabindex", "-1");
+    gFire.appendChild(c);
+    return c;
+  });
+  /* Riskiest last so they paint on top of the low-risk field. */
+  D.fires.map(function (f, i) { return [f.risk, i]; })
+         .sort(function (a, b) { return a[0] - b[0]; })
+         .forEach(function (p) { gFire.appendChild(nodes[p[1]]); });
+
+  var gLab = document.createElementNS(NS, "g");
+  (D.labels || []).forEach(function (l) {
+    var v = toView(l[1], l[2]);
+    var t = document.createElementNS(NS, "text");
+    t.setAttribute("x", v[0].toFixed(2));
+    t.setAttribute("y", v[1].toFixed(2));
+    t.setAttribute("class", "plabel");
+    t.textContent = l[0];
+    gLab.appendChild(t);
+  });
+  svg.appendChild(gLab);
+
+  /* ---- tooltip -------------------------------------------------------- */
+  var tip = $("tip"), wrap = document.querySelector(".mapwrap");
+  function showTip(f, evt) {
+    tip.innerHTML =
+      '<div class="id">' + f.ag + "  " + f.id + "</div>" +
+      '<div class="row"><span>risk</span><b>' + (f.risk * 100).toFixed(1) + "%</b></div>" +
+      '<div class="row"><span>ha at 24 h</span><b>' + fmt(f.dec, 1) + "</b></div>" +
+      '<div class="row"><span>ha now</span><b>' + fmt(f.now) + "</b></div>" +
+      '<div class="row"><span>hotspots</span><b>' + fmt(f.hs) + "</b></div>" +
+      '<div class="row"><span>first seen</span><b>' + f.age + " d ago</b></div>";
+    var r = wrap.getBoundingClientRect();
+    var x = evt.clientX - r.left + 14, y = evt.clientY - r.top + 14;
+    if (x + 200 > r.width) x = evt.clientX - r.left - 200;
+    if (y + 130 > r.height) y = evt.clientY - r.top - 130;
+    tip.style.left = Math.max(4, x) + "px";
+    tip.style.top = Math.max(4, y) + "px";
+    tip.classList.add("show");
+  }
+  function hideTip() { tip.classList.remove("show"); }
+
+  /* ---- state ---------------------------------------------------------- */
+  var band = "all", agency = "ALL", sortKey = "risk", sortDir = -1;
+
+  var agencies = D.fires.map(function (f) { return f.ag; })
+    .filter(function (v, i, a) { return v && a.indexOf(v) === i; }).sort();
+  var sel = $("agency");
+  sel.innerHTML = '<option value="ALL">All agencies</option>' +
+    agencies.map(function (a) { return '<option value="' + a + '">' + a + "</option>"; }).join("");
+
+  function passes(f) {
+    if (agency !== "ALL" && f.ag !== agency) return false;
+    if (band === "elevated") return f.risk >= 0.10;
+    if (band === "high") return f.risk >= 0.25;
+    return true;
+  }
+
+  function render() {
+    var shown = [];
+    D.fires.forEach(function (f, i) {
+      var ok = passes(f);
+      nodes[i].classList.toggle("dim", !ok);
+      if (ok) shown.push(f);
+    });
+
+    var keyed = {
+      id:   function (f) { return f.ag + f.id; },
+      risk: function (f) { return f.risk; },
+      dec:  function (f) { return f.dec; },
+      now:  function (f) { return f.now; },
+      age:  function (f) { return f.age; }
+    }[sortKey];
+    shown.sort(function (a, b) {
+      var x = keyed(a), y = keyed(b);
+      if (x < y) return -sortDir;
+      if (x > y) return sortDir;
+      return b.risk - a.risk;
+    });
+
+    var rows = shown.slice(0, 250).map(function (f) {
+      return '<tr data-i="' + D.fires.indexOf(f) + '">' +
+        '<td><span class="agency">' + f.ag + "</span> " + f.id +
+        '<br><span class="status">' + f.st + "</span></td>" +
+        '<td class="risk"><span class="dot" style="background:' + bandOf(f.risk).css + '"></span>' +
+        (f.risk * 100).toFixed(1) + "%</td>" +
+        "<td>" + fmt(f.dec, 1) + "</td>" +
+        "<td>" + fmt(f.now) + "</td>" +
+        "<td>" + f.age + " d</td></tr>";
+    }).join("");
+
+    $("tbody").innerHTML = rows;
+    $("empty").hidden = shown.length > 0;
+    $("count").textContent = shown.length.toLocaleString("en-CA") + " of " +
+      D.fires.length.toLocaleString("en-CA") + " fires" +
+      (shown.length > 250 ? " \u00b7 top 250 listed" : "");
+  }
+
+  /* ---- interactions --------------------------------------------------- */
+  document.querySelectorAll(".chip").forEach(function (b) {
+    b.addEventListener("click", function () {
+      band = b.dataset.band;
+      document.querySelectorAll(".chip").forEach(function (o) {
+        o.setAttribute("aria-pressed", String(o === b));
+      });
+      render();
+    });
+  });
+  sel.addEventListener("change", function () { agency = sel.value; render(); });
+
+  document.querySelectorAll("thead th").forEach(function (th) {
+    th.querySelector("button").addEventListener("click", function () {
+      var k = th.dataset.k;
+      if (sortKey === k) { sortDir = -sortDir; }
+      else { sortKey = k; sortDir = k === "id" ? 1 : -1; }
+      document.querySelectorAll("thead th").forEach(function (o) { o.removeAttribute("aria-sort"); });
+      th.setAttribute("aria-sort", sortDir === 1 ? "ascending" : "descending");
+      render();
+    });
+  });
+
+  var lastRow = null;
+  $("tbody").addEventListener("mouseover", function (e) {
+    var tr = e.target.closest("tr");
+    if (!tr || tr === lastRow) return;
+    if (lastRow) { nodes[+lastRow.dataset.i].classList.remove("on"); lastRow.classList.remove("on"); }
+    lastRow = tr; tr.classList.add("on");
+    nodes[+tr.dataset.i].classList.add("on");
+  });
+  $("tbody").addEventListener("mouseleave", function () {
+    if (lastRow) { nodes[+lastRow.dataset.i].classList.remove("on"); lastRow.classList.remove("on"); lastRow = null; }
+  });
+
+  gFire.addEventListener("mousemove", function (e) {
+    var i = nodes.indexOf(e.target);
+    if (i < 0) return;
+    showTip(D.fires[i], e);
+  });
+  gFire.addEventListener("mouseout", hideTip);
+  svg.addEventListener("mouseleave", hideTip);
+
+  /* ---- static content ------------------------------------------------- */
+  $("asof-stamp").textContent = D.meta.asof;
+  $("asof-note").textContent = D.meta.window;
+  $("foot-gen").textContent = "generated " + D.meta.generated;
+
+  $("readouts").innerHTML = D.readouts.map(function (r) {
+    return '<div class="readout"><div class="k">' + r.k + '</div>' +
+      '<div class="v ' + (r.tone || "") + '">' + r.v + "</div>" +
+      '<div class="s">' + r.s + "</div></div>";
+  }).join("");
+
+  $("charts").innerHTML = D.charts.map(function (c) {
+    return '<figure class="chart">' +
+      '<img class="lt" src="' + c.light + '" alt="' + c.alt + '">' +
+      '<img class="dk" src="' + c.dark + '" alt="' + c.alt + '">' +
+      "<figcaption>" + c.caption + "</figcaption></figure>";
+  }).join("");
+
+  $("method").innerHTML = D.method;
+
+  render();
+})();
+</script>

@@ -14,6 +14,33 @@ Three legs, each load-bearing:
 
 ---
 
+## The dashboard
+
+One self-contained HTML file — a map of every fire reported in the last three
+weeks, shaded by modelled escalation risk, with the ranked watchlist beside it
+and the validation charts below:
+
+```bash
+python -m wildfire dashboard
+```
+
+Writes [`docs/dashboard.html`](docs/dashboard.html) (~570 KB) with everything
+inlined: provincial boundaries, the scored fires, and the charts as base64. It
+makes **zero external requests**, so it works offline and cannot lose its
+basemap to a CDN that moved. It is rebuilt from the same artefacts the CLI
+writes, so the page cannot drift from the model it describes.
+
+The map is Lambert conformal conic — the projection Canada is conventionally
+drawn in. Equirectangular would stretch Nunavut badly enough to misplace
+northern fires by eye.
+
+> The page carries a prominent notice that this is a research model and not
+> operational guidance. That is not boilerplate: it shows real fires that are
+> burning right now, and someone landing on it cold could otherwise mistake it
+> for something official.
+
+---
+
 ## The idea the project is built on
 
 The CWFIF reported-fires layer is **bitemporal**. Every fire carries many rows,

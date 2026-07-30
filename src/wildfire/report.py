@@ -77,13 +77,16 @@ THEMES = (LIGHT, DARK)
 SANS = ["Segoe UI", "DejaVu Sans", "Helvetica", "Arial", "sans-serif"]
 
 
+DPI = 200
+
+
 def _fig(theme: Theme, figsize):
     import matplotlib.pyplot as plt
 
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = SANS
 
-    fig, ax = plt.subplots(figsize=figsize, dpi=200)
+    fig, ax = plt.subplots(figsize=figsize, dpi=DPI)
     fig.patch.set_facecolor(theme.surface)
     ax.set_facecolor(theme.surface)
     for side in ("top", "right"):
@@ -410,12 +413,24 @@ FIGURES = {
 }
 
 
-def generate(outdir: Path | None = None) -> list[Path]:
+def generate(outdir: Path | None = None, *, dpi: int = 200,
+             suffix: str = "") -> list[Path]:
+    """Render every figure in both themes.
+
+    `dpi` is lowered for the dashboard, where eight figures are inlined as
+    base64 and full-resolution PNGs would triple the page weight for detail
+    nobody can see at the size they are displayed.
+    """
+    global DPI
     outdir = outdir or DOCS_IMG
-    written = []
-    for name, fn in FIGURES.items():
-        for theme in THEMES:
-            path = outdir / f"{name}-{theme.name}.png"
-            fn(theme, path)
-            written.append(path)
-    return written
+    previous, DPI = DPI, dpi
+    try:
+        written = []
+        for name, fn in FIGURES.items():
+            for theme in THEMES:
+                path = outdir / f"{name}-{theme.name}{suffix}.png"
+                fn(theme, path)
+                written.append(path)
+        return written
+    finally:
+        DPI = previous

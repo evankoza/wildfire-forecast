@@ -233,6 +233,26 @@ carry two columns the archives lack (`estarea`, `bfc`); ingestion intersects
 the schema across seasons so the feature set never depends on how a year
 happened to be fetched.
 
+### ✅ Dashboard
+
+`wildfire dashboard` builds `docs/dashboard.html` — a single self-contained
+file, no external requests, everything inlined. Boundaries come from Natural
+Earth via `src/wildfire/assets/canada_provinces.json` (13 provinces simplified
+with Douglas–Peucker to 23 KB); charts are re-rendered at 110 dpi rather than
+the README's 200, because eight full-resolution PNGs as base64 would triple the
+page for detail invisible at display size.
+
+Two things to know before editing it:
+
+- **The template must stay pure ASCII inside `<script>`.** The page declares no
+  charset of its own, so a raw `·` or `—` in a JS string literal is at the
+  mercy of the host's `Content-Type` — it rendered as `Â·` when served locally.
+  Markup can use entities; JS strings must use `\uXXXX`. There is a check for
+  this: `python -c "print(open(p,encoding='utf-8').read().isascii())"`.
+- **`docs/dashboard.html` is committed but generated.** Regenerate rather than
+  hand-edit, and avoid committing a rebuild unless the content actually
+  changed — it is 577 KB and will bloat history if it lands every run.
+
 ## 4. Priority work
 
 ### P5 — The second model (ignition risk)
