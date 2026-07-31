@@ -176,10 +176,6 @@ would mean re-deriving fire science that has already been done properly. It
 earns its place for two things this project does not currently need: latency
 (about three hours after overpass, against next morning) and coverage outside
 Canada. It is also the only source that requires a key.</p>
-
-<p class="src-foot">For authoritative, current fire information use the
-<a href="https://cwfis.cfs.nrcan.gc.ca/interactive-map">CWFIS interactive map</a>
-or your provincial agency &mdash; not this page.</p>
 """
 
 

@@ -303,7 +303,6 @@
   .srctable td.spare::before {
     content: "\2014"; margin-right: 6px; opacity: .7;
   }
-  .src-foot { font-size: 13px; color: var(--ink-2); }
   /* The explanatory paragraphs under the table read as prose, so they get a
      reading measure even though the table above them is full width. */
   #sources h3 { margin-top: 30px; }
@@ -333,10 +332,7 @@
   .foot-row {
     display: flex; flex-wrap: wrap; gap: 8px 22px; justify-content: space-between;
   }
-  .foot-note {
-    margin: 0; max-width: 88ch; color: var(--ink-2); line-height: 1.65;
-  }
-  .foot-note b { color: var(--ink); }
+  .foot-note { margin: 0; color: var(--ink-2); }
   footer.foot a { color: var(--ink-2); }
 
   @media (prefers-reduced-motion: reduce) {
@@ -427,9 +423,7 @@
 
   <footer class="foot">
     <p class="foot-note">
-      <b>Research model, not operational guidance.</b> A personal forecasting
-      project on public data, not endorsed by any fire agency. For current fire
-      information use the
+      For authoritative, current fire information use the
       <a href="https://cwfis.cfs.nrcan.gc.ca/interactive-map">CWFIS interactive map</a>
       or your provincial agency.
     </p>
