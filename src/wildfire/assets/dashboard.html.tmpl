@@ -295,21 +295,28 @@
     display: block; font-size: 10.5px; color: var(--ink-3);
     letter-spacing: .04em; margin-top: 3px;
   }
-  /* Honesty channel: whether a source actually feeds the model. Encoded in
-     form as well as words, so the "wired up but unused" rows cannot be
-     skimmed as if they were contributing. */
-  .srctable td.yes  { color: var(--accent); }
-  .srctable td.part { color: var(--sev-1); }
-  .srctable td.no   { color: var(--ink-3); }
+  /* Three roles, distinguished by mark as well as wording. An earlier version
+     used a hollow circle for the sources that do not feed the model, which
+     read as an unticked checkbox -- i.e. as unfinished work rather than as a
+     decision. A filled dot means "in the model"; an em-rule means
+     "deliberately not", which is a statement rather than an absence. */
+  .srctable td.yes   { color: var(--accent); }
+  .srctable td.null  { color: var(--sev-1); }
+  .srctable td.spare { color: var(--ink-3); }
   .srctable td.yes::before,
-  .srctable td.part::before,
-  .srctable td.no::before {
+  .srctable td.null::before {
     content: ""; display: inline-block; width: 6px; height: 6px;
     border-radius: 50%; margin-right: 7px; vertical-align: middle;
     background: currentColor;
   }
-  .srctable td.no::before { background: transparent; box-shadow: inset 0 0 0 1px currentColor; }
+  .srctable td.spare::before {
+    content: "\2014"; margin-right: 6px; opacity: .7;
+  }
   .src-foot { font-size: 13px; color: var(--ink-2); }
+  /* The explanatory paragraphs under the table read as prose, so they get a
+     reading measure even though the table above them is full width. */
+  #sources h3 { margin-top: 30px; }
+  #sources > p { max-width: 74ch; }
 
   .prose { max-width: 68ch; }
   .prose p { margin: 0 0 14px; }

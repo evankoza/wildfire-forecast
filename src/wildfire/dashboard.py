@@ -102,15 +102,14 @@ never directly measured on these fires.</p>
 
 
 SOURCES_HTML = """
-<p>Everything here is public data, and the whole Canadian pipeline runs with
-<b>no API keys at all</b>. Sources are listed with what they actually
-contribute &mdash; including the two that are wired up but not currently
-feeding the model, because listing them as if they were would overstate it.</p>
+<p>All public data, and the whole Canadian pipeline runs with <b>no API keys at
+all</b>. The NRCan feeds below are published through the
+<a href="https://cwfis.cfs.nrcan.gc.ca/datamart">CWFIS Datamart</a>.</p>
 
 <div class="tablewrap srcwrap">
 <table class="srctable">
   <thead>
-    <tr><th>Source</th><th>What it gives</th><th>Used here</th></tr>
+    <tr><th>Source</th><th>What it gives</th><th>Role</th></tr>
   </thead>
   <tbody>
     <tr>
@@ -121,36 +120,62 @@ feeding the model, because listing them as if they were would overstate it.</p>
     <tr>
       <td><a href="https://cwfis.cfs.nrcan.gc.ca/downloads/hotspots/">CWFIS satellite hotspots</a><span class="src-note">NRCan &middot; daily + season archives</span></td>
       <td>Satellite detections already carrying Canadian fire-behaviour outputs: head fire intensity, rate of spread, fuel type and consumption. 9.1&nbsp;million detections across 2023&ndash;26.</td>
-      <td class="yes">Strongest features</td>
+      <td class="yes">The strongest features</td>
+    </tr>
+    <tr>
+      <td><a href="https://www.naturalearthdata.com/">Natural Earth</a></td>
+      <td>Provincial and territorial boundaries, simplified from 705&nbsp;KB to 23&nbsp;KB so the page carries its own basemap.</td>
+      <td class="yes">This map</td>
     </tr>
     <tr>
       <td><a href="https://ciffc.net/situation/">CIFFC situation report</a><span class="src-note">via <a href="https://api.ciffc.net/v1/sitrep">api.ciffc.net/v1/sitrep</a></span></td>
       <td>National and per-agency preparedness levels &mdash; the human judgement about how stretched crews and aircraft are. No machine feed produces this.</td>
-      <td class="part">Ingested; no measurable effect on escalation</td>
-    </tr>
-    <tr>
-      <td><a href="https://cwfis.cfs.nrcan.gc.ca/datamart">CWFIS Datamart</a><span class="src-note">NRCan</span></td>
-      <td>The wider catalogue these feeds sit in &mdash; fire weather indices, burned-area composites, the national fire database, fuel grids.</td>
-      <td class="part">Reference / future work</td>
+      <td class="null">Ingested. Measured effect: none</td>
     </tr>
     <tr>
       <td><a href="https://open-meteo.com/en/docs/historical-weather-api">Open-Meteo ERA5 archive</a></td>
       <td>Hourly reanalysis weather &mdash; temperature, humidity, wind, gusts, precipitation &mdash; back to 1940. No key required.</td>
-      <td class="no">Wired up, off by default</td>
+      <td class="spare">Already covered by hotspot FWI</td>
     </tr>
     <tr>
       <td><a href="https://firms.modaps.eosdis.nasa.gov/">NASA FIRMS</a><span class="src-note">MODIS &amp; VIIRS</span></td>
       <td>Near-real-time active fire detections worldwide, within about three hours of satellite overpass.</td>
-      <td class="no">Optional; the Canadian feed is richer</td>
-    </tr>
-    <tr>
-      <td><a href="https://www.naturalearthdata.com/">Natural Earth</a></td>
-      <td>Provincial and territorial boundaries for the map, simplified to 23&nbsp;KB.</td>
-      <td class="yes">This map</td>
+      <td class="spare">Same satellites as CWFIS, less detail</td>
     </tr>
   </tbody>
 </table>
 </div>
+
+<h3>Why three of these are not feeding the model</h3>
+
+<p><b>CIFFC preparedness is a result, not a gap.</b> It is ingested, backfilled
+to 2019, and joined onto 98.5% of fires with a point-in-time-safe as-of join on
+publication time. Its effect on escalation was then measured at +0.002 PR-AUC,
+with an interval straddling zero. The likely reason is structural: preparedness
+is one value per agency per day, so every fire burning in one province that day
+shares it &mdash; and day-of-year plus agency already encode most of that
+seasonal-and-regional load pattern. It stays ingested because an
+agency-and-day covariate is exactly the right shape for the ignition model,
+where the unit of prediction is a grid cell and a day. Reporting it as helpful
+would be easier and false.</p>
+
+<p><b>Open-Meteo would mostly repeat what the hotspots already carry.</b> Every
+satellite detection arrives with the Fire Weather Index computed at that pixel,
+and FWI is precisely a compression of the drought, wind and humidity history
+that ERA5 would supply. So the marginal gain is unproven, while the cost is one
+request per grid cell per date window &mdash; thousands per season against a
+free public service. The client is built and a flag turns it on; the experiment
+to show it earns that cost has not been run, and until it has, leaving it off
+is the honest default rather than the lazy one.</p>
+
+<p><b>NASA FIRMS is a strict subset here.</b> It publishes raw detections from
+the same satellites CWFIS uses &mdash; VIIRS and MODIS &mdash; but NRCan ships
+them already enriched with Canadian Fire Behaviour Prediction outputs: head fire
+intensity, rate of spread, fuel type, fuel consumption. Using FIRMS instead
+would mean re-deriving fire science that has already been done properly. It
+earns its place for two things this project does not currently need: latency
+(about three hours after overpass, against next morning) and coverage outside
+Canada. It is also the only source that requires a key.</p>
 
 <p class="src-foot">For authoritative, current fire information use the
 <a href="https://cwfis.cfs.nrcan.gc.ca/interactive-map">CWFIS interactive map</a>
