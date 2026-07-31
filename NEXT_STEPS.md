@@ -242,13 +242,39 @@ with Douglas–Peucker to 23 KB); charts are re-rendered at 110 dpi rather than
 the README's 200, because eight full-resolution PNGs as base64 would triple the
 page for detail invisible at display size.
 
-Two things to know before editing it:
+Four things to know before editing it:
 
+- **The map is Canvas, and it was SVG first, for three reasons.** 1,032 circles
+  as DOM nodes made hover visibly laggy (hit-testing walked every node); SVG
+  `text` sized in `px` inside a viewBox whose entire width is 0.87 *user units*
+  renders each glyph about nine times the width of the map, which painted a
+  giant grey letterform over everything; and the y-flip is far easier to get
+  right once in a transform than across a DOM tree.
+- **Projected y grows north; screen y grows down.** The flip lives in `sy()`
+  and nowhere else. Getting it wrong renders the whole country upside down,
+  and it is not obvious from any structural check — the paths are all valid.
+- **Hit-test synchronously, coalesce only the repaint.** An earlier version did
+  both inside `requestAnimationFrame`; wherever rAF is throttled (background
+  tab, non-compositing pane) the "queued" flag latched on and hover stopped
+  working permanently. The hit test costs ~0.2 ms over 1,032 points.
+- **The canvas does not restyle itself on a theme change.** It paints with
+  resolved token values, so there is an explicit repaint on both the
+  `prefers-color-scheme` media query and a `MutationObserver` watching
+  `data-theme`. Add a token to the map and it must be read in `readPalette`.
 - **The template must stay pure ASCII inside `<script>`.** The page declares no
   charset of its own, so a raw `·` or `—` in a JS string literal is at the
   mercy of the host's `Content-Type` — it rendered as `Â·` when served locally.
   Markup can use entities; JS strings must use `\uXXXX`. There is a check for
   this: `python -c "print(open(p,encoding='utf-8').read().isascii())"`.
+
+**How to actually verify it.** The published artifact is private, so the in-app
+browser cannot open it; serve `docs/` over `http.server` and drive that. And
+screenshots fail when the pane is not displayed, which is exactly how the
+upside-down map shipped — every structural check passed. Two techniques that
+work without a screenshot: sample the canvas into a coarse ASCII grid
+(`getImageData`, classify by colour, print ~76x30) which makes the country's
+shape and orientation immediately obvious; and sample a patch of land before
+and after flipping `data-theme` to prove the repaint fired.
 - **`docs/dashboard.html` is committed but generated.** Regenerate rather than
   hand-edit, and avoid committing a rebuild unless the content actually
   changed — it is 577 KB and will bloat history if it lands every run.

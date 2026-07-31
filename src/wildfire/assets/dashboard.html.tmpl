@@ -21,8 +21,8 @@
     --sev-0:    #6d7f83;
     --sev-1:    #b3741f;
     --sev-2:    #c4432e;
-    --land:     #e3e9e8;
-    --land-ink: #c3cfcf;
+    --land:     #dde6e4;
+    --land-ink: #a6b8b8;
     --shadow:   0 1px 2px rgba(15,23,25,.06), 0 8px 24px rgba(15,23,25,.05);
   }
   @media (prefers-color-scheme: dark) {
@@ -41,8 +41,8 @@
       --sev-0:    #55686c;
       --sev-1:    #c8842a;
       --sev-2:    #d4523c;
-      --land:     #182124;
-      --land-ink: #2b393d;
+      --land:     #1b2629;
+      --land-ink: #3a4d52;
       --shadow:   0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.28);
     }
   }
@@ -61,8 +61,8 @@
     --sev-0:    #55686c;
     --sev-1:    #c8842a;
     --sev-2:    #d4523c;
-    --land:     #182124;
-    --land-ink: #2b393d;
+    --land:     #1b2629;
+    --land-ink: #3a4d52;
     --shadow:   0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.28);
   }
 
@@ -176,17 +176,15 @@
     border: 1px solid var(--rule); border-radius: 2px;
   }
 
-  /* ---- map ----------------------------------------------------------- */
+  /* ---- map ------------------------------------------------------------
+     Canvas, not SVG. Three reasons, all learned the hard way: 1,032 circles
+     as DOM nodes made hover hit-testing visibly laggy; SVG text sized in px
+     inside a viewBox whose whole width is 0.87 user units renders each glyph
+     about nine times the width of the map; and the y-flip between projected
+     coordinates and screen coordinates is far easier to get right once, in
+     one transform, than to reason about across a DOM tree. */
   .mapwrap { position: relative; padding: 6px; }
-  svg.map { width: 100%; height: auto; display: block; }
-  .prov { fill: var(--land); stroke: var(--land-ink); stroke-width: .7; stroke-linejoin: round; }
-  .fire { stroke: var(--panel); stroke-width: .6; cursor: pointer; }
-  .fire.dim { opacity: .12; }
-  .fire.on { stroke: var(--ink); stroke-width: 1.4; }
-  .plabel {
-    font-family: var(--mono); font-size: 7.5px; letter-spacing: .1em;
-    fill: var(--ink-3); pointer-events: none; text-anchor: middle;
-  }
+  canvas.map { width: 100%; display: block; cursor: crosshair; }
   .tip {
     position: absolute; pointer-events: none; z-index: 5;
     background: var(--panel); border: 1px solid var(--rule);
@@ -332,7 +330,7 @@
         </div>
       </header>
       <div class="mapwrap">
-        <svg class="map" id="map" role="img" aria-label="Map of Canada showing recently reported fires, coloured by modelled escalation risk"></svg>
+        <canvas class="map" id="map" role="img" aria-label="Map of Canada showing recently reported fires, coloured by modelled escalation risk"></canvas>
         <div class="tip" id="tip" role="status"></div>
       </div>
       <div class="legend">
@@ -426,89 +424,153 @@
     return [rho * Math.sin(th), RHO0 - rho * Math.cos(th)];
   }
 
-  /* ---- fit the projected geometry to a viewBox ------------------------ */
+  /* ---- projected extent ----------------------------------------------- */
   var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+  var rings = [];
   D.provinces.forEach(function (p) {
     p.r.forEach(function (ring) {
-      ring.forEach(function (c) {
-        var q = project(c[0], c[1]);
+      var pts = new Float64Array(ring.length * 2);
+      for (var i = 0; i < ring.length; i++) {
+        var q = project(ring[i][0], ring[i][1]);
+        pts[i * 2] = q[0]; pts[i * 2 + 1] = q[1];
         if (q[0] < minX) minX = q[0];
         if (q[0] > maxX) maxX = q[0];
         if (q[1] < minY) minY = q[1];
         if (q[1] > maxY) maxY = q[1];
-      });
+      }
+      rings.push(pts);
     });
   });
-  var PAD = 0.02 * (maxX - minX);
-  var VW = (maxX - minX) + PAD * 2, VH = (maxY - minY) + PAD * 2;
-  function toView(lon, lat) {
-    var q = project(lon, lat);
-    return [q[0] - minX + PAD, q[1] - minY + PAD];
+  var spanX = maxX - minX, spanY = maxY - minY;
+  var ASPECT = spanX / spanY;
+
+  var cv = $("map"), ctx = cv.getContext("2d");
+  var W = 0, H = 0, scale = 1, offX = 0, offY = 0, dpr = 1;
+
+  function layout() {
+    var cssW = cv.clientWidth || 600;
+    var cssH = Math.round(cssW / ASPECT);
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.round(cssW * dpr);
+    cv.height = Math.round(cssH * dpr);
+    cv.style.height = cssH + "px";
+    W = cssW; H = cssH;
+    var pad = 8;
+    scale = Math.min((W - pad * 2) / spanX, (H - pad * 2) / spanY);
+    offX = (W - spanX * scale) / 2;
+    offY = (H - spanY * scale) / 2;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  var svg = $("map"), NS = "http://www.w3.org/2000/svg";
-  svg.setAttribute("viewBox", "0 0 " + VW.toFixed(4) + " " + VH.toFixed(4));
+  /* The y-flip lives here and nowhere else: projected y grows northward,
+     screen y grows downward. Getting this wrong once rendered the whole
+     country upside down. */
+  function sx(px) { return offX + (px - minX) * scale; }
+  function sy(py) { return offY + (maxY - py) * scale; }
 
-  var gLand = document.createElementNS(NS, "g");
-  D.provinces.forEach(function (p) {
-    var d = "";
-    p.r.forEach(function (ring) {
-      ring.forEach(function (c, i) {
-        var v = toView(c[0], c[1]);
-        d += (i ? "L" : "M") + v[0].toFixed(4) + " " + v[1].toFixed(4);
-      });
-      d += "Z";
-    });
-    var path = document.createElementNS(NS, "path");
-    path.setAttribute("d", d);
-    path.setAttribute("class", "prov");
-    gLand.appendChild(path);
-  });
-  svg.appendChild(gLand);
-
-  var gFire = document.createElementNS(NS, "g");
-  svg.appendChild(gFire);
-
-  /* Area-proportional radius, floored so a 0.1 ha fire is still clickable
-     and capped so one 73,000 ha fire does not swallow the map. */
-  var RMIN = VW * 0.0035, RMAX = VW * 0.019;
+  /* Area-proportional radius, floored so a 0.1 ha fire stays hoverable and
+     capped so one 73,000 ha fire does not swallow the map. */
   function radius(ha) {
     var t = Math.sqrt(Math.min(Math.max(ha, 0), 20000) / 20000);
-    return RMIN + t * (RMAX - RMIN);
+    return 2.2 + t * 11;
   }
 
-  var nodes = D.fires.map(function (f) {
-    var v = toView(f.lon, f.lat);
-    var c = document.createElementNS(NS, "circle");
-    c.setAttribute("cx", v[0].toFixed(3));
-    c.setAttribute("cy", v[1].toFixed(3));
-    c.setAttribute("r", radius(f.now).toFixed(3));
-    c.setAttribute("fill", bandOf(f.risk).css);
-    c.setAttribute("class", "fire");
-    c.setAttribute("tabindex", "-1");
-    gFire.appendChild(c);
-    return c;
-  });
-  /* Riskiest last so they paint on top of the low-risk field. */
-  D.fires.map(function (f, i) { return [f.risk, i]; })
-         .sort(function (a, b) { return a[0] - b[0]; })
-         .forEach(function (p) { gFire.appendChild(nodes[p[1]]); });
+  /* Paint order: least-risky first, so the handful that matter sit on top of
+     the low-risk field rather than under it. */
+  var order = D.fires.map(function (f, i) { return i; })
+                     .sort(function (a, b) { return D.fires[a].risk - D.fires[b].risk; });
 
-  var gLab = document.createElementNS(NS, "g");
-  (D.labels || []).forEach(function (l) {
-    var v = toView(l[1], l[2]);
-    var t = document.createElementNS(NS, "text");
-    t.setAttribute("x", v[0].toFixed(2));
-    t.setAttribute("y", v[1].toFixed(2));
-    t.setAttribute("class", "plabel");
-    t.textContent = l[0];
-    gLab.appendChild(t);
+  var css = getComputedStyle(document.documentElement);
+  function tok(n) { return css.getPropertyValue(n).trim(); }
+  var PAL = {};
+  function readPalette() {
+    css = getComputedStyle(document.documentElement);
+    PAL = {
+      land: tok("--land"), landInk: tok("--land-ink"), ink3: tok("--ink-3"),
+      ink: tok("--ink"), panel: tok("--panel"),
+      sev: [tok("--sev-2"), tok("--sev-1"), tok("--sev-0")]
+    };
+  }
+  function sevColour(r) {
+    return r >= 0.25 ? PAL.sev[0] : r >= 0.10 ? PAL.sev[1] : PAL.sev[2];
+  }
+
+  var hoverIdx = -1, visible = new Uint8Array(D.fires.length).fill(1);
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    ctx.fillStyle = PAL.land;
+    ctx.strokeStyle = PAL.landInk;
+    ctx.lineWidth = 0.8;
+    ctx.lineJoin = "round";
+    for (var r = 0; r < rings.length; r++) {
+      var pts = rings[r];
+      ctx.beginPath();
+      ctx.moveTo(sx(pts[0]), sy(pts[1]));
+      for (var i = 2; i < pts.length; i += 2) ctx.lineTo(sx(pts[i]), sy(pts[i + 1]));
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    ctx.font = '600 9px ' + tok("--mono");
+    ctx.fillStyle = PAL.ink3;
+    ctx.textAlign = "center";
+    (D.labels || []).forEach(function (l) {
+      var q = project(l[1], l[2]);
+      ctx.fillText(l[0], sx(q[0]), sy(q[1]));
+    });
+
+    ctx.lineWidth = 0.8;
+    for (var k = 0; k < order.length; k++) {
+      var idx = order[k], f = D.fires[idx];
+      if (!visible[idx]) continue;
+      var x = sx(f._x), y = sy(f._y), rad = radius(f.now);
+      ctx.beginPath();
+      ctx.arc(x, y, rad, 0, 6.2832);
+      ctx.fillStyle = sevColour(f.risk);
+      ctx.globalAlpha = 0.88;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = PAL.panel;
+      ctx.stroke();
+    }
+
+    if (hoverIdx >= 0 && visible[hoverIdx]) {
+      var h = D.fires[hoverIdx];
+      ctx.beginPath();
+      ctx.arc(sx(h._x), sy(h._y), radius(h.now) + 3, 0, 6.2832);
+      ctx.strokeStyle = PAL.ink;
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+    }
+  }
+
+  /* Cache projected coordinates and a stable index once; recomputing 1,032
+     log/tan pairs on every repaint is what a hover handler cannot afford,
+     and `indexOf` per table row is what a filter cannot. */
+  D.fires.forEach(function (f, i) {
+    var q = project(f.lon, f.lat);
+    f._x = q[0]; f._y = q[1]; f._i = i;
   });
-  svg.appendChild(gLab);
+
+  function hitTest(mx, my) {
+    var best = -1, bestD = Infinity;
+    for (var k = order.length - 1; k >= 0; k--) {
+      var idx = order[k];
+      if (!visible[idx]) continue;
+      var f = D.fires[idx];
+      var dx = sx(f._x) - mx, dy = sy(f._y) - my;
+      var d2 = dx * dx + dy * dy, rad = radius(f.now) + 2;
+      if (d2 <= rad * rad && d2 < bestD) { bestD = d2; best = idx; }
+    }
+    return best;
+  }
 
   /* ---- tooltip -------------------------------------------------------- */
   var tip = $("tip"), wrap = document.querySelector(".mapwrap");
-  function showTip(f, evt) {
+  function showTip(f, mx, my) {
     tip.innerHTML =
       '<div class="id">' + f.ag + "  " + f.id + "</div>" +
       '<div class="row"><span>risk</span><b>' + (f.risk * 100).toFixed(1) + "%</b></div>" +
@@ -516,15 +578,39 @@
       '<div class="row"><span>ha now</span><b>' + fmt(f.now) + "</b></div>" +
       '<div class="row"><span>hotspots</span><b>' + fmt(f.hs) + "</b></div>" +
       '<div class="row"><span>first seen</span><b>' + f.age + " d ago</b></div>";
-    var r = wrap.getBoundingClientRect();
-    var x = evt.clientX - r.left + 14, y = evt.clientY - r.top + 14;
-    if (x + 200 > r.width) x = evt.clientX - r.left - 200;
-    if (y + 130 > r.height) y = evt.clientY - r.top - 130;
-    tip.style.left = Math.max(4, x) + "px";
-    tip.style.top = Math.max(4, y) + "px";
+    var pad = 6;
+    var x = mx + 16, y = my + 16;
+    if (x + 190 > W) x = mx - 190;
+    if (y + 132 > H) y = my - 132;
+    tip.style.left = Math.max(pad, x) + "px";
+    tip.style.top = Math.max(pad, y) + "px";
     tip.classList.add("show");
   }
   function hideTip() { tip.classList.remove("show"); }
+
+  /* The hit test runs synchronously -- it costs about 0.2 ms over 1,032
+     points, so deferring it buys nothing and costs correctness. Only the
+     repaint is coalesced into a frame. An earlier version did both inside
+     requestAnimationFrame, which meant that in any context where rAF is
+     throttled (a background tab, a pane that is not compositing) the "queued"
+     flag latched on and hover stopped resolving entirely. */
+  var drawQueued = false;
+  function scheduleDraw() {
+    if (drawQueued) return;
+    drawQueued = true;
+    requestAnimationFrame(function () { drawQueued = false; draw(); });
+  }
+
+  cv.addEventListener("mousemove", function (e) {
+    var r = cv.getBoundingClientRect();
+    var mx = e.clientX - r.left, my = e.clientY - r.top;
+    var i = hitTest(mx, my);
+    if (i >= 0) showTip(D.fires[i], mx, my); else hideTip();
+    if (i !== hoverIdx) { hoverIdx = i; scheduleDraw(); }
+  });
+  cv.addEventListener("mouseleave", function () {
+    hoverIdx = -1; hideTip(); scheduleDraw();
+  });
 
   /* ---- state ---------------------------------------------------------- */
   var band = "all", agency = "ALL", sortKey = "risk", sortDir = -1;
@@ -546,9 +632,11 @@
     var shown = [];
     D.fires.forEach(function (f, i) {
       var ok = passes(f);
-      nodes[i].classList.toggle("dim", !ok);
+      visible[i] = ok ? 1 : 0;
       if (ok) shown.push(f);
     });
+    if (hoverIdx >= 0 && !visible[hoverIdx]) { hoverIdx = -1; hideTip(); }
+    draw();
 
     var keyed = {
       id:   function (f) { return f.ag + f.id; },
@@ -565,7 +653,9 @@
     });
 
     var rows = shown.slice(0, 250).map(function (f) {
-      return '<tr data-i="' + D.fires.indexOf(f) + '">' +
+      /* f._i is stamped once at load. `indexOf` here would be a linear scan
+         per row -- 250 x 1,032 on every filter or sort. */
+      return '<tr data-i="' + f._i + '">' +
         '<td><span class="agency">' + f.ag + "</span> " + f.id +
         '<br><span class="status">' + f.st + "</span></td>" +
         '<td class="risk"><span class="dot" style="background:' + bandOf(f.risk).css + '"></span>' +
@@ -609,21 +699,15 @@
   $("tbody").addEventListener("mouseover", function (e) {
     var tr = e.target.closest("tr");
     if (!tr || tr === lastRow) return;
-    if (lastRow) { nodes[+lastRow.dataset.i].classList.remove("on"); lastRow.classList.remove("on"); }
+    if (lastRow) lastRow.classList.remove("on");
     lastRow = tr; tr.classList.add("on");
-    nodes[+tr.dataset.i].classList.add("on");
+    hoverIdx = +tr.dataset.i;
+    draw();
   });
   $("tbody").addEventListener("mouseleave", function () {
-    if (lastRow) { nodes[+lastRow.dataset.i].classList.remove("on"); lastRow.classList.remove("on"); lastRow = null; }
+    if (lastRow) { lastRow.classList.remove("on"); lastRow = null; }
+    hoverIdx = -1; draw();
   });
-
-  gFire.addEventListener("mousemove", function (e) {
-    var i = nodes.indexOf(e.target);
-    if (i < 0) return;
-    showTip(D.fires[i], e);
-  });
-  gFire.addEventListener("mouseout", hideTip);
-  svg.addEventListener("mouseleave", hideTip);
 
   /* ---- static content ------------------------------------------------- */
   $("asof-stamp").textContent = D.meta.asof;
@@ -645,6 +729,27 @@
 
   $("method").innerHTML = D.method;
 
+  /* ---- boot and keep the canvas in step with its box and its theme ----- */
+  readPalette();
+  layout();
   render();
+
+  var rt;
+  window.addEventListener("resize", function () {
+    clearTimeout(rt);
+    rt = setTimeout(function () { layout(); draw(); }, 120);
+  });
+
+  /* The canvas paints with resolved token values, so unlike CSS it does not
+     restyle itself when the theme flips. Repaint on both the OS preference
+     and the viewer's own toggle, which stamps data-theme on <html>. */
+  if (window.matchMedia) {
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    (mq.addEventListener ? mq.addEventListener.bind(mq, "change") : mq.addListener.bind(mq))(
+      function () { readPalette(); draw(); }
+    );
+  }
+  new MutationObserver(function () { readPalette(); draw(); })
+    .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 })();
 </script>
