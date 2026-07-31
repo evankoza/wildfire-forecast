@@ -48,9 +48,15 @@ def ingest_fires(
 def ingest_hotspots(
     years: list[int] = typer.Option(..., "--years", "-y"),
     force: bool = typer.Option(False, "--force"),
+    merge: bool = typer.Option(
+        False,
+        "--merge",
+        help="Refresh only these seasons, keeping the others already curated. "
+        "Without it the curated table is replaced by exactly the years given.",
+    ),
 ):
     """Pull CWFIS satellite hotspot archives."""
-    df = cwfis_hotspots.load_seasons(years, force=force)
+    df = cwfis_hotspots.load_seasons(years, force=force, merge=merge)
     console.print(f"[green]{df.height:,}[/] hotspot detections")
 
 

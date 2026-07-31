@@ -123,7 +123,23 @@ def drop_non_fuel(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def load_seasons(years: list[int], *, force: bool = False) -> pl.DataFrame:
+def load_seasons(
+    years: list[int], *, force: bool = False, merge: bool = False
+) -> pl.DataFrame:
+    """Fetch whole seasons and write `curated/hotspots.parquet`.
+
+    By default this REPLACES the curated table with exactly the years asked
+    for, which is what you want for a deliberate rebuild.
+
+    `merge=True` instead refreshes only those years in place, keeping every
+    other season already on disk. That is the difference between a nightly
+    refresh costing one season and costing every season the model trains on:
+    the archive zips for closed years never change, so re-parsing 535 MB of
+    them to pick up today's detections is pure waste. Refreshed years are
+    dropped by `rep_date` year and replaced wholesale rather than upserted per
+    row, because the daily files are the authority for a season in progress
+    and a partial overlay would leave yesterday's rows behind twice.
+    """
     frames = []
     for y in years:
         try:
@@ -136,6 +152,29 @@ def load_seasons(years: list[int], *, force: bool = False) -> pl.DataFrame:
     if not frames:
         raise RuntimeError(f"no hotspot detections loaded for {years}")
 
+    dest = config.CURATED / "hotspots.parquet"
+
+    if merge:
+        if not dest.exists():
+            log.info("no curated hotspots yet; merge falls through to a plain write")
+        else:
+            existing = pl.read_parquet(dest)
+            if "rep_date" not in existing.columns:
+                raise RuntimeError(
+                    f"{dest.name} has no rep_date column, so seasons cannot be told "
+                    "apart -- rebuild it with a plain (non-merge) ingest"
+                )
+            kept = existing.filter(~pl.col("rep_date").dt.year().is_in(years))
+            log.info(
+                "merging %s season(s) into %s: keeping %s rows from other seasons, "
+                "replacing %s",
+                len(years), dest.name, kept.height, existing.height - kept.height,
+            )
+            # Prepended so the column intersection below sees the on-disk table
+            # too. That makes the existing feature set part of the negotiation
+            # rather than something a single-season refresh can silently widen.
+            frames.insert(0, kept)
+
     # The rolling daily files carry two columns the season archives do not
     # (`estarea`, `bfc`), so a naive concat raises on mismatched schemas -- and
     # papering over that with a diagonal concat would be worse: the current
@@ -147,11 +186,14 @@ def load_seasons(years: list[int], *, force: bool = False) -> pl.DataFrame:
     ordered = [c for c in SCHEMA if c in common]
     dropped = sorted(set().union(*(set(f.columns) for f in frames)) - common)
     if dropped:
-        log.info("hotspot columns absent from at least one season, dropped: %s", dropped)
+        # On a merge this is louder than it looks: a column the existing table
+        # has and the incoming season lacks gets dropped for EVERY year, not
+        # just the refreshed one. Consistency still wins (see above), but it
+        # should never happen quietly.
+        log.warning("hotspot columns absent from at least one season, dropped: %s", dropped)
 
     df = pl.concat([f.select(ordered) for f in frames], how="vertical_relaxed")
     df = drop_non_fuel(df)
-    dest = config.CURATED / "hotspots.parquet"
     df.write_parquet(dest)
     log.info("wrote %s hotspot detections -> %s", df.height, dest)
     return df
