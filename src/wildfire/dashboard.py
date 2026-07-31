@@ -101,6 +101,63 @@ never directly measured on these fires.</p>
 """
 
 
+SOURCES_HTML = """
+<p>Everything here is public data, and the whole Canadian pipeline runs with
+<b>no API keys at all</b>. Sources are listed with what they actually
+contribute &mdash; including the two that are wired up but not currently
+feeding the model, because listing them as if they were would overstate it.</p>
+
+<div class="tablewrap srcwrap">
+<table class="srctable">
+  <thead>
+    <tr><th>Source</th><th>What it gives</th><th>Used here</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="https://geoserver.cwfif.nrcan.gc.ca/geoserver/wfs?service=WFS&amp;version=2.0.1&amp;request=GetCapabilities">CWFIF national GeoServer</a><span class="src-note">NRCan &middot; WFS</span></td>
+      <td>Every reported fire with its full revision history &mdash; size, control status, cause, response type. The bitemporal stamps on these records are what make an honest forecast possible.</td>
+      <td class="yes">Fire state and the label</td>
+    </tr>
+    <tr>
+      <td><a href="https://cwfis.cfs.nrcan.gc.ca/downloads/hotspots/">CWFIS satellite hotspots</a><span class="src-note">NRCan &middot; daily + season archives</span></td>
+      <td>Satellite detections already carrying Canadian fire-behaviour outputs: head fire intensity, rate of spread, fuel type and consumption. 9.1&nbsp;million detections across 2023&ndash;26.</td>
+      <td class="yes">Strongest features</td>
+    </tr>
+    <tr>
+      <td><a href="https://ciffc.net/situation/">CIFFC situation report</a><span class="src-note">via <a href="https://api.ciffc.net/v1/sitrep">api.ciffc.net/v1/sitrep</a></span></td>
+      <td>National and per-agency preparedness levels &mdash; the human judgement about how stretched crews and aircraft are. No machine feed produces this.</td>
+      <td class="part">Ingested; no measurable effect on escalation</td>
+    </tr>
+    <tr>
+      <td><a href="https://cwfis.cfs.nrcan.gc.ca/datamart">CWFIS Datamart</a><span class="src-note">NRCan</span></td>
+      <td>The wider catalogue these feeds sit in &mdash; fire weather indices, burned-area composites, the national fire database, fuel grids.</td>
+      <td class="part">Reference / future work</td>
+    </tr>
+    <tr>
+      <td><a href="https://open-meteo.com/en/docs/historical-weather-api">Open-Meteo ERA5 archive</a></td>
+      <td>Hourly reanalysis weather &mdash; temperature, humidity, wind, gusts, precipitation &mdash; back to 1940. No key required.</td>
+      <td class="no">Wired up, off by default</td>
+    </tr>
+    <tr>
+      <td><a href="https://firms.modaps.eosdis.nasa.gov/">NASA FIRMS</a><span class="src-note">MODIS &amp; VIIRS</span></td>
+      <td>Near-real-time active fire detections worldwide, within about three hours of satellite overpass.</td>
+      <td class="no">Optional; the Canadian feed is richer</td>
+    </tr>
+    <tr>
+      <td><a href="https://www.naturalearthdata.com/">Natural Earth</a></td>
+      <td>Provincial and territorial boundaries for the map, simplified to 23&nbsp;KB.</td>
+      <td class="yes">This map</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p class="src-foot">For authoritative, current fire information use the
+<a href="https://cwfis.cfs.nrcan.gc.ca/interactive-map">CWFIS interactive map</a>
+or your provincial agency &mdash; not this page.</p>
+"""
+
+
 def _b64(path: Path) -> str:
     return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode("ascii")
 
@@ -182,6 +239,7 @@ def build(*, out: Path | None = None, top_map: int | None = None) -> Path:
         "readouts": _readouts(df, meta),
         "charts": charts,
         "method": METHOD_HTML,
+        "sources": SOURCES_HTML,
     }
 
     html = TEMPLATE.read_text(encoding="utf-8").replace(
