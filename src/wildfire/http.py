@@ -124,6 +124,41 @@ def fetch_to_file(url: str, dest: Path, *, conditional: bool = True) -> tuple[Pa
     return dest, True
 
 
+def stream_to_file(url: str, dest: Path, *, chunk: int = 1 << 20) -> Path:
+    """Download `url` to `dest` without holding it in memory.
+
+    `fetch_to_file` reads the whole body before writing, which is fine for a
+    CSV page and not fine for the 430 MB decadal FWI archive. Writes to a
+    `.part` file and renames on success, so an interrupted download can never
+    be mistaken for a complete one on the next run.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    meta = _load_meta()
+
+    _throttle(url)
+    n = 0
+    with client() as c, c.stream("GET", url) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as fh:
+            for block in r.iter_bytes(chunk):
+                fh.write(block)
+                n += len(block)
+        headers = dict(r.headers)
+
+    tmp.replace(dest)
+    meta[url] = {
+        "etag": headers.get("etag"),
+        "last_modified": headers.get("last-modified"),
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "bytes": n,
+        "status": 200,
+    }
+    _save_meta(meta)
+    log.info("streamed %s (%.0f MB) -> %s", url, n / 1e6, dest.name)
+    return dest
+
+
 def get_text(url: str) -> str:
     with client() as c:
         r = _get(c, url)

@@ -111,10 +111,19 @@ def build(
 
 
 def _fmt_ci(ci: dict, key: str) -> str:
+    """Format an interval with enough digits to be an interval.
+
+    The escalation model's PR-AUCs are around 0.26 and three decimals are
+    plenty; the ignition model's are around 0.019 against a 0.0009 base rate,
+    and three decimals round two of the three numbers in a row to the same
+    value. Scale the precision to the magnitude rather than picking one and
+    making half the tables useless.
+    """
     lo_hi = ci.get(key)
     if not lo_hi:
         return "-"
-    return f"[{lo_hi[0]:.3f}, {lo_hi[1]:.3f}]"
+    digits = 3 if max(abs(v) for v in lo_hi) >= 0.1 else 5
+    return f"[{lo_hi[0]:.{digits}f}, {lo_hi[1]:.{digits}f}]"
 
 
 def _interval_header(ci: dict) -> str:
@@ -237,6 +246,69 @@ def _spatial(df, agencies, test_years, min_positives, drop_geography, n_boot):
     console.print(rt)
 
 
+def _ablation_table(res: dict, title: str, digits: int = 4) -> Table:
+    t = Table(title=title, header_style="bold")
+    lo, hi = res["percentiles"][0], res["percentiles"][-1]
+    for c in ("feature set", "PR-AUC", f"{lo}-{hi} pctile", "delta vs full",
+              "paired interval", "P(full better)"):
+        t.add_column(c, justify="right" if c != "feature set" else "left")
+    for r in res["rows"]:
+        d = r.get("delta_vs_full")
+        t.add_row(
+            r["feature_set"], str(r["pr_auc"]),
+            f"[{r['interval'][0]}, {r['interval'][1]}]",
+            "-" if d is None else f"{d:+.{digits}f}",
+            "-" if d is None else f"[{r['delta_interval'][0]}, {r['delta_interval'][1]}]",
+            "-" if d is None else str(r["p_full_is_better"]),
+        )
+    return t
+
+
+@app.command("ablate")
+def ablate(
+    test_years: list[int] = typer.Option(None, "--test-years"),
+    n_boot: int = typer.Option(1000, "--bootstrap"),
+):
+    """Which blocks of features the escalation model actually needs.
+
+    Every variant is refit on the same split and the differences are
+    bootstrapped paired, which is the only way this table is readable: with
+    ~117 positives every marginal interval swallows every other point estimate.
+    """
+    df = pl.read_parquet(config.CURATED / "modelling_table.parquet")
+    res = escalation.ablation(df, test_years=test_years or None, n_boot=n_boot)
+    console.print(_ablation_table(
+        res, f"Escalation feature ablation - test {res['test_years']}, "
+             f"{res['n_positives_test']} positives"))
+    console.print(f"[dim]size-at-decision baseline: {res['pr_auc_size_only']}[/]")
+
+
+@app.command("compare-geography")
+def compare_geography(
+    test_years: list[int] = typer.Option(None, "--test-years"),
+    min_positives: int = typer.Option(10, "--min-positives"),
+    n_boot: int = typer.Option(1000, "--bootstrap"),
+):
+    """Do lat/lon/agency/region help or hurt in country the model has not seen?
+
+    Runs the leave-one-agency-out backtest with and without them and pairs the
+    two on the same pooled out-of-region fires.
+    """
+    df = pl.read_parquet(config.CURATED / "modelling_table.parquet")
+    res = escalation.geography_paired(
+        df, test_years=test_years or None, min_test_positives=min_positives,
+        n_boot=n_boot,
+    )
+    t = Table(title="Pooled out-of-region PR-AUC, paired", header_style="bold")
+    t.add_column("metric"); t.add_column("value", justify="right")
+    for k in ("n_pooled", "n_positives", "pr_auc_with_geography",
+              "pr_auc_without_geography", "paired_delta", "delta_interval",
+              "p_geography_helps"):
+        t.add_row(k, str(res[k]))
+    console.print(t)
+    console.print(f"[dim]folds: {', '.join(res['agencies'])}[/]")
+
+
 @app.command("ingest-ciffc")
 def ingest_ciffc(
     years: list[int] = typer.Option(None, "--years", "-y"),
@@ -329,6 +401,304 @@ def predict_cmd(
     console.print(t)
     console.print(f"[dim]risk = P(>= {SPEC.size_threshold_ha:.0f} ha by T0+{SPEC.horizon_hours}h), "
                   f"as known {SPEC.decision_hours}h after first report[/]")
+
+
+@app.command("ingest-fwi")
+def ingest_fwi(
+    years: list[int] = typer.Option(..., "--years", "-y"),
+    force: bool = typer.Option(False, "--force"),
+    daily: bool = typer.Option(
+        False, "--daily",
+        help="pull the season in progress from fwi_obs/current/ one day at a "
+             "time and merge it in, keeping the other seasons. The decadal "
+             "archive lags by most of a year, so this is the only way to score "
+             "today.",
+    ),
+):
+    """Pull station weather and Fire Weather Index observations.
+
+    The exogenous leg of the ignition model: the hotspot feed's FWI exists
+    only where something was already burning, which would make it circular
+    evidence for where a fire will start. Backfill is one large decadal file,
+    streamed once and re-parsed thereafter.
+    """
+    from .sources import cwfis_fwi
+
+    df = (cwfis_fwi.load_current(years, force=force) if daily
+          else cwfis_fwi.load(years, force=force))
+    console.print(
+        f"[green]{df.height:,}[/] station-days across "
+        f"{df['aes'].n_unique():,} stations"
+    )
+    t = Table(title="Station FWI coverage", header_style="bold")
+    for c in ("year", "n_days", "first_day", "last_day", "n_stations", "n_rows",
+              "fwi_reported", "mean_fwi"):
+        t.add_column(c, justify="right")
+    for r in cwfis_fwi.coverage(df).iter_rows(named=True):
+        t.add_row(*(str(r[c]) for c in ("year", "n_days", "first_day", "last_day",
+                                        "n_stations", "n_rows", "fwi_reported",
+                                        "mean_fwi")))
+    console.print(t)
+
+
+@app.command("build-ignition")
+def build_ignition(
+    years: list[int] = typer.Option(None, "--years", "-y",
+                                    help="seasons to pose the question over"),
+    area_years: list[int] = typer.Option(
+        None, "--area-years",
+        help="seasons the study area is drawn from; must EXCLUDE any season "
+             "you intend to evaluate on, or the domain is defined by the "
+             "fires you are about to forecast",
+    ),
+    neg_rate: float = typer.Option(
+        None, "--neg-rate", help="fraction of non-event cell-days kept"
+    ),
+):
+    """Assemble the ignition panel: one row per 10 km cell per day."""
+    from .features import ignition as ig_feat
+
+    fires = pl.read_parquet(config.CURATED / "reported_fires.parquet")
+    hs_path = config.CURATED / "hotspots.parquet"
+    hotspots = pl.read_parquet(hs_path) if hs_path.exists() else pl.DataFrame()
+    obs_path = config.CURATED / "station_fwi.parquet"
+    if not obs_path.exists():
+        raise typer.BadParameter("run ingest-fwi first")
+    obs = pl.read_parquet(obs_path)
+
+    seasons = years or sorted({d.year for d in obs["obs_date"].to_list()})
+    area = area_years or seasons[:-1] or seasons
+    if set(area) & set(seasons[-1:]) and len(seasons) > 1:
+        console.print(
+            "[yellow]the study area includes the last season you are modelling; "
+            "that is a look-ahead unless you mean to score, not evaluate[/]"
+        )
+
+    df = ig_feat.build_panel(
+        fires, hotspots, obs, years=seasons, area_years=area,
+        neg_rate=neg_rate if neg_rate is not None else ig_feat.NEG_RATE,
+    )
+    console.print(
+        f"[green]{df.height:,}[/] cell-days; "
+        f"[bold]{int(df[ig_feat.TARGET].sum()):,}[/] with an ignition "
+        f"({100 * df[ig_feat.TARGET].mean():.2f}% of the sample)"
+    )
+
+
+@app.command("backtest-ignition")
+def backtest_ignition(
+    test_years: list[int] = typer.Option(None, "--test-years"),
+    holdout_agency: list[str] = typer.Option(
+        None, "--holdout-agency", "-a",
+        help="hold out a REGION: repeat per agency, or ALL to sweep",
+    ),
+    min_positives: int = typer.Option(50, "--min-positives"),
+    drop_geography: bool = typer.Option(False, "--drop-geography"),
+    drop_network: bool = typer.Option(
+        False, "--drop-network",
+        help="refit without wx_dist_km / wx_n_stations, which measure the "
+             "observing network rather than the ground",
+    ),
+    drop_ciffc: bool = typer.Option(False, "--drop-ciffc"),
+    n_boot: int = typer.Option(1000, "--bootstrap"),
+):
+    """Train on earlier seasons (or other regions), evaluate on held-out ones."""
+    from .models import ignition as ig_model
+
+    df = pl.read_parquet(config.CURATED / "ignition_table.parquet")
+
+    if holdout_agency:
+        agencies = None if [a.upper() for a in holdout_agency] == ["ALL"] else \
+            [a.upper() for a in holdout_agency]
+        _spatial_ignition(df, agencies, test_years, min_positives,
+                          drop_geography, n_boot)
+        return
+
+    res = ig_model.train_and_backtest(
+        df, test_years=test_years or None, n_boot=n_boot,
+        drop_network=drop_network, drop_ciffc=drop_ciffc,
+    )
+
+    t = Table(title="Ignition backtest (season-blocked)", header_style="bold")
+    t.add_column("metric"); t.add_column("value", justify="right")
+    t.add_column(_interval_header(res.ci), justify="right")
+    d = asdict(res)
+    for k in ("train_years", "test_years", "n_train", "n_test",
+              "n_positives_test", "neg_rate", "population_prevalence",
+              "pr_auc_model", "pr_auc_fwi", "pr_auc_climatology",
+              "lift_over_fwi", "lift_over_climatology",
+              "roc_auc_model", "brier_model", "brier_prevalence"):
+        t.add_row(k, str(d[k]), _fmt_ci(res.ci, k) if k == "pr_auc_model" else "")
+    if res.ci.get("pr_auc_delta"):
+        t.add_row(f"[bold]model - {res.ci['baseline']}[/]",
+                  str(round(res.pr_auc_model - (
+                      res.pr_auc_climatology if res.ci["baseline"] == "climatology"
+                      else res.pr_auc_fwi), 5)),
+                  _fmt_ci(res.ci, "pr_auc_delta"))
+        t.add_row("P(model > baseline)", str(res.ci["p_model_beats_baseline"]), "")
+    console.print(t)
+    console.print(
+        "[dim]PR-AUC is sample-weighted back onto the true cell-day prevalence, "
+        "so it is comparable with the baselines and not with an unweighted "
+        "figure.[/]"
+    )
+    if res.brier_model > res.brier_prevalence:
+        console.print(
+            "[yellow]Brier is worse than predicting the base rate: the ranking "
+            "is informative but the probability scale is not. See the "
+            "reliability table.[/]"
+        )
+
+    ft = Table(title="Top features", header_style="bold")
+    ft.add_column("feature"); ft.add_column("gain", justify="right")
+    for name, gain in res.top_features:
+        ft.add_row(name, str(gain))
+    console.print(ft)
+
+    rt = Table(title="Calibration (test, population-weighted)", header_style="bold")
+    for c in ("bucket", "n", "mean_predicted", "observed_rate"):
+        rt.add_column(c, justify="right")
+    for r in res.reliability:
+        rt.add_row(str(r["bucket"]), str(r["n"]), str(r["mean_predicted"]),
+                   str(r["observed_rate"]))
+    console.print(rt)
+
+
+def _spatial_ignition(df, agencies, test_years, min_positives, drop_geography, n_boot):
+    from .models import ignition as ig_model
+
+    res = ig_model.spatial_backtest(
+        df, agencies=agencies, test_years=test_years or None,
+        min_test_positives=min_positives, drop_geography=drop_geography,
+        n_boot=n_boot,
+    )
+    title = f"Ignition leave-one-agency-out - {res.mode}"
+    if res.dropped_features:
+        title += f" - without {', '.join(res.dropped_features)}"
+    t = Table(title=title, header_style="bold")
+    for c in ("held out", "n_test", "pos", "PR-AUC",
+              _interval_header(res.pooled["ci"]), "fwi", "clim", "P(beats)"):
+        t.add_column(c, justify="right" if c != "held out" else "left")
+    for f in res.folds:
+        best = max(f.pr_auc_fwi, f.pr_auc_climatology)
+        colour = "green" if f.pr_auc_model > best else "red"
+        t.add_row(
+            f.holdout_agency, f"{f.n_test:,}", str(f.n_positives_test),
+            f"[{colour}]{f.pr_auc_model}[/]", _fmt_ci(f.ci, "pr_auc_model"),
+            str(f.pr_auc_fwi), str(f.pr_auc_climatology),
+            str(f.ci.get("p_model_beats_baseline", "-")),
+        )
+    p = res.pooled
+    t.add_section()
+    t.add_row("[bold]POOLED[/]", f"{p['n_test']:,}", str(p["n_positives"]),
+              f"[bold]{p['pr_auc_model']}[/]", _fmt_ci(p["ci"], "pr_auc_model"),
+              str(p["pr_auc_fwi"]), str(p["pr_auc_climatology"]),
+              str(p["ci"].get("p_model_beats_baseline", "-")))
+    console.print(t)
+    console.print(
+        f"train seasons {res.train_years} / test seasons {res.test_years} - "
+        f"{res.macro['folds_beating_climatology']}/{res.macro['n_folds']} folds "
+        f"beat their own climatology, median lift over fire weather "
+        f"{res.macro['median_lift_over_fwi']}x"
+    )
+    for s in res.skipped:
+        console.print(f"[yellow]skipped {s['agency']}: {s['reason']}[/]")
+
+
+@app.command("ablate-ignition")
+def ablate_ignition(
+    test_years: list[int] = typer.Option(None, "--test-years"),
+    n_boot: int = typer.Option(1000, "--bootstrap"),
+):
+    """Which blocks of features earn their place, paired on one resample."""
+    from .models import ignition as ig_model
+
+    df = pl.read_parquet(config.CURATED / "ignition_table.parquet")
+    res = ig_model.ablation(df, test_years=test_years or None, n_boot=n_boot)
+    console.print(_ablation_table(
+        res, f"Ignition feature ablation - test {res['test_years']}, "
+             f"{res['n_positives_test']:,} positives", digits=5))
+    console.print(
+        "[dim]deltas are bootstrapped paired on the same resampled test rows, "
+        "so they are readable where the marginal intervals overlap[/]"
+    )
+
+
+@app.command("fit-final-ignition")
+def fit_final_ignition():
+    """Refit the ignition model on every season in the panel, for scoring."""
+    from .models import ignition as ig_model
+
+    df = pl.read_parquet(config.CURATED / "ignition_table.parquet")
+    payload = ig_model.fit_final(df)
+    console.print(
+        f"final ignition model: [green]{payload['n_train']:,}[/] cell-days, "
+        f"[bold]{payload['n_positives']:,}[/] ignitions, seasons "
+        f"{payload['train_years']}"
+    )
+    console.print("[dim]accuracy for this model is inferred from the backtest, "
+                  "not measured on the rows it was fitted on[/]")
+
+
+@app.command("predict-ignition")
+def predict_ignition_cmd(
+    day: str = typer.Option(None, "--day", help="ISO date; default = the day "
+                                                "after the last observation"),
+    days: int = typer.Option(1, "--days", help="how many days back to score"),
+    top: int = typer.Option(15, "--top"),
+):
+    """Rank grid cells by the probability of a fire being reported today."""
+    from datetime import date as _date
+
+    from . import predict as predict_mod
+
+    target = _date.fromisoformat(day) if day else None
+    df = predict_mod.score_ignition(day=target, days=days)
+    if df.is_empty():
+        console.print("[yellow]no cells scored[/]")
+        return
+
+    latest = df["day"].max()
+    shown = df.filter(pl.col("day") == latest).head(top)
+    t = Table(title=f"Ignition risk {latest} - top {shown.height} of "
+                    f"{df.filter(pl.col('day') == latest).height:,} cells",
+              header_style="bold")
+    for c, j in (("cell", "left"), ("lat, lon", "left"), ("agency", "left"),
+                 ("FWI", "right"), ("km to stn", "right"),
+                 ("fires/yr", "right"), ("risk", "right")):
+        t.add_column(c, justify=j)
+    for r in shown.iter_rows(named=True):
+        risk = r["risk"]
+        colour = "red" if risk >= 0.05 else "yellow" if risk >= 0.01 else "white"
+        t.add_row(
+            f"{r['cell_x']},{r['cell_y']}",
+            f"{r['lat']:.2f}, {r['lon']:.2f}",
+            r["agency_code"] or "--",
+            f"{r['wx_fwi']:.1f}" if r["wx_fwi"] is not None else "-",
+            f"{r['wx_dist_km']:.0f}" if r["wx_dist_km"] is not None else "-",
+            str(int(r["ig_n_365d"] or 0)),
+            f"[{colour}]{risk:.4f}[/]",
+        )
+    console.print(t)
+    console.print("[dim]risk = P(at least one new fire reported in this 10 km "
+                  "cell on this day), on the population scale[/]")
+
+
+@app.command("serve")
+def serve_cmd(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    reload: bool = typer.Option(False, "--reload"),
+):
+    """Serve the scored artefacts over HTTP.
+
+    Reads what the CLI has already written; nothing here ingests or refits.
+    Needs the optional extra: pip install -e ".[serve]"
+    """
+    from . import api
+
+    console.print(f"[green]http://{host}:{port}[/]  docs at /docs")
+    api.serve(host=host, port=port, reload=reload)
 
 
 @app.command("report")

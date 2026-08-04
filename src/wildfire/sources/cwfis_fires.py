@@ -122,6 +122,43 @@ def fetch_year(year: int, *, force: bool = False) -> pl.DataFrame:
     return _normalise(df)
 
 
+# A revision's transaction time has to sit inside a plausible window around
+# the season it belongs to. A handful of rows do not: 2023 fires carrying a
+# record_start in 2011, which is not a late correction but a bad timestamp.
+#
+# They matter out of all proportion to their number. T0 is `min(record_start)`
+# per fire, so one row dated twelve years early moves that fire's whole
+# decision instant, and every as-of feature is then computed from a window
+# that ended before the fire existed.
+#
+# The window is deliberately loose: from the start of the *previous* calendar
+# year (a fire discovered in late December can be filed against the next fire
+# year, and some agencies backfill early) to the end of the year after the
+# season. Anything outside that is a data fault, not a reporting quirk.
+RECORD_START_LOOKBACK_YEARS = 1
+RECORD_START_LOOKAHEAD_YEARS = 1
+
+
+def quarantine_record_start(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Split off revision rows whose `record_start` cannot belong to their season.
+
+    Returns `(kept, quarantined)`. Nothing is deleted -- the rejected rows are
+    written alongside the curated table so the count can be audited and the
+    rule argued with, rather than becoming a filter nobody can see.
+    """
+    if "record_start" not in df.columns or "fire_year" not in df.columns:
+        return df, df.head(0)
+
+    lo = pl.date(pl.col("fire_year") - RECORD_START_LOOKBACK_YEARS, 1, 1)
+    hi = pl.date(pl.col("fire_year") + RECORD_START_LOOKAHEAD_YEARS, 12, 31)
+    plausible = (
+        pl.col("record_start").is_null()
+        | pl.col("fire_year").is_null()
+        | pl.col("record_start").dt.date().is_between(lo, hi)
+    )
+    return df.filter(plausible), df.filter(~plausible)
+
+
 def _normalise(df: pl.DataFrame) -> pl.DataFrame:
     """Parse timestamps, clean sentinels, drop the projected geometry blob."""
     exprs = []
@@ -152,6 +189,17 @@ def load(years: list[int], *, force: bool = False) -> pl.DataFrame:
     if not frames:
         raise RuntimeError(f"no reported-fire rows returned for years {years}")
     df = pl.concat(frames, how="vertical_relaxed")
+
+    df, rejected = quarantine_record_start(df)
+    if rejected.height:
+        qdest = config.CURATED / "reported_fires_quarantine.parquet"
+        rejected.write_parquet(qdest)
+        log.warning(
+            "quarantined %s of %s revision rows on an implausible record_start "
+            "(%s fires affected) -> %s",
+            rejected.height, rejected.height + df.height,
+            rejected["national_fire_id"].n_unique(), qdest.name,
+        )
 
     dest = config.CURATED / "reported_fires.parquet"
     df.write_parquet(dest)

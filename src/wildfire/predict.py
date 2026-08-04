@@ -18,7 +18,7 @@ Two things keep it honest:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import polars as pl
@@ -157,4 +157,115 @@ def score(
     dest = config.MODELS / "current_risk.parquet"
     out.write_parquet(dest)
     log.info("scored %s fires -> %s", out.height, dest)
+    return out
+
+
+def score_ignition(
+    *,
+    day: date | None = None,
+    days: int = 1,
+    prefer_final: bool = True,
+) -> pl.DataFrame:
+    """Rank every cell in the study area by P(a fire is reported there today).
+
+    Scoring is cheap in a way the training panel is not: the panel had to
+    sample negatives because it spans hundreds of days, but a single day is
+    one pass over the ~59,000 study-area cells and there is nothing to sample.
+    Every cell is scored.
+
+    Two things are different from training and both are deliberate:
+
+    * **The study area is drawn from every season on disk**, not just the
+      training ones. Restricting it was a guard against evaluating on a domain
+      defined by the test season's own fires; at serving time there is no
+      test season, and narrowing the domain would just blind the model to
+      country that has burned since.
+    * **The probability is prior-corrected** with the `neg_rate` stored in the
+      fitted model, not with whatever the current default happens to be. A
+      model fitted under one sampling rate and corrected with another is off
+      by exactly the ratio, and nothing would raise.
+    """
+    import joblib
+
+    from .features import ignition as ig_feat
+    from .models.ignition import _feature_frame, correct_prior
+
+    fires_path = config.CURATED / "reported_fires.parquet"
+    obs_path = config.CURATED / "station_fwi.parquet"
+    if not fires_path.exists():
+        raise RuntimeError("no fire data -- run `wildfire ingest-fires` first")
+    if not obs_path.exists():
+        raise RuntimeError("no station weather -- run `wildfire ingest-fwi` first")
+
+    fires = pl.read_parquet(fires_path)
+    station_obs = pl.read_parquet(obs_path)
+    hs_path = config.CURATED / "hotspots.parquet"
+    hotspots = pl.read_parquet(hs_path) if hs_path.exists() else pl.DataFrame()
+
+    final = config.MODELS / "ignition_final.joblib"
+    backtest = config.MODELS / "ignition_lgbm.joblib"
+    if prefer_final and final.exists():
+        payload = joblib.load(final)
+    elif backtest.exists():
+        payload = joblib.load(backtest)
+        log.warning(
+            "scoring with the BACKTEST ignition model (trained on %s only). Run "
+            "`wildfire fit-final-ignition` to fit on every season.",
+            payload.get("train_years"),
+        )
+    else:
+        raise RuntimeError("no fitted ignition model -- run `wildfire backtest-ignition`")
+
+    events = ig_feat.ignition_events(fires)
+    seasons = sorted({d.year for d in events["day"].to_list() if d is not None})
+    area = ig_feat.study_area(events, hotspots, years=seasons)
+
+    # The last day a feature row can be built for is one past the newest
+    # station observation: the decision instant at 00:00 reads the previous
+    # day's noon reading, so the day after the last observation is scoreable
+    # and the one after that is not.
+    last_obs = station_obs["obs_date"].max()
+    target = day or (last_obs + timedelta(days=1))
+    wanted = [target - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    scoreable = [d for d in wanted if d <= last_obs + timedelta(days=1)]
+    if not scoreable:
+        raise RuntimeError(
+            f"the station record ends {last_obs}, so {target} cannot be scored. "
+            "Re-run `wildfire ingest-fwi` or pass an earlier --day."
+        )
+    if len(scoreable) != len(wanted):
+        log.warning("station record ends %s; scoring %s of %s requested days",
+                    last_obs, len(scoreable), len(wanted))
+
+    panel = pl.concat(
+        [area.with_columns(pl.lit(d, dtype=pl.Date).alias("day")) for d in scoreable],
+        how="vertical",
+    )
+    feats = ig_feat.assemble_features(panel, events, hotspots, station_obs)
+
+    X, _ = _feature_frame(feats, categories=payload["levels"])
+    missing = [c for c in payload["columns"] if c not in X.columns]
+    if missing:
+        raise RuntimeError(
+            f"the fitted model expects features today's panel lacks: {missing}"
+        )
+    X = X[payload["columns"]]
+
+    p_sample = payload["base"].predict_proba(X)[:, 1]
+    if payload.get("calibrator") is not None:
+        p_sample = payload["calibrator"].predict(p_sample)
+    risk = correct_prior(p_sample, payload["neg_rate"])
+
+    out = (
+        feats.select(
+            "cell_x", "cell_y", "day", "lat", "lon", "agency_code",
+            "wx_fwi", "wx_dist_km", "hs_n_7d", "ig_n_365d",
+        )
+        .with_columns(pl.Series("risk", risk))
+        .sort(["day", "risk"], descending=[False, True])
+    )
+
+    dest = config.MODELS / "ignition_risk.parquet"
+    out.write_parquet(dest)
+    log.info("scored %s cell-days -> %s", out.height, dest)
     return out

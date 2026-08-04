@@ -403,6 +403,141 @@ def chart_importance(theme: Theme, out: Path, top: int = 12):
     _save(fig, out, theme)
 
 
+def chart_ignition_regions(theme: Theme, out: Path):
+    """The ignition model against the two things an agency already has.
+
+    A **log** x-axis, which is not a default worth reaching for lightly. Here
+    it is forced by the data: PR-AUC across the folds spans two orders of
+    magnitude, because the chance of a fire being reported in a given 10 km
+    cell on a given day is a hundred times higher in the Yukon's short intense
+    season than on the Nova Scotia coast. On a linear axis every fold except
+    the top one collapses onto the left edge and the comparison -- which is
+    the entire point of the chart -- becomes unreadable.
+
+    Both baselines are drawn, because they say different things. Fire weather
+    is the map already on the wall at 6am; climatology is the knowledge that
+    fires keep starting in the same places. Beating one and not the other
+    would not be a result.
+    """
+    data = _json("ignition_spatial_backtest_region.json")["result"]
+    folds = sorted(data["folds"], key=lambda f: f["pr_auc_model"])
+    pooled = data["pooled"]
+
+    labels, mid, lo, hi, fwi, clim = [], [], [], [], [], []
+    for f in folds:
+        ci = (f.get("ci") or {}).get("pr_auc_model") or [f["pr_auc_model"]] * 2
+        labels.append(f"{f['holdout_agency']}  pos={f['n_positives_test']:,}")
+        mid.append(f["pr_auc_model"])
+        lo.append(ci[0]); hi.append(ci[1])
+        fwi.append(f["pr_auc_fwi"]); clim.append(f["pr_auc_climatology"])
+
+    p_ci = (pooled.get("ci") or {}).get("pr_auc_model") or [pooled["pr_auc_model"]] * 2
+    labels.append(f"POOLED  pos={pooled['n_positives']:,}")
+    mid.append(pooled["pr_auc_model"])
+    lo.append(p_ci[0]); hi.append(p_ci[1])
+    fwi.append(pooled["pr_auc_fwi"]); clim.append(pooled["pr_auc_climatology"])
+
+    n = len(labels)
+    ypos = np.arange(n)
+    fig, ax = _fig(theme, (6.8, 0.44 * n + 2.0))
+    ax.grid(axis="y", visible=False)
+    ax.set_xscale("log")
+
+    for i in range(n):
+        is_pooled = i == n - 1
+        ax.plot([lo[i], hi[i]], [ypos[i], ypos[i]], color=theme.series_1,
+                linewidth=2.0, alpha=0.45, solid_capstyle="round", zorder=2)
+        ax.plot(mid[i], ypos[i], marker="o", markersize=9 if is_pooled else 7.5,
+                color=theme.series_1, markeredgecolor=theme.surface,
+                markeredgewidth=1.5, zorder=4,
+                label="Model PR-AUC (5-95%)" if i == 0 else None)
+        ax.plot(clim[i], ypos[i], marker="|", markersize=11, markeredgewidth=2.4,
+                color=theme.series_2, zorder=3,
+                label="Where fires keep starting" if i == 0 else None)
+        ax.plot(fwi[i], ypos[i], marker="|", markersize=8, markeredgewidth=1.8,
+                color=theme.muted, zorder=3,
+                label="Fire weather index alone" if i == 0 else None)
+
+    ax.axhline(n - 1.5, color=theme.axis, linewidth=1.0, linestyle=(0, (3, 3)), zorder=1)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(labels, fontsize=8.5, color=theme.ink_secondary)
+    ax.set_ylim(-0.7, n - 0.3)
+    ax.set_xlabel("PR-AUC on the held-out agency (log scale)",
+                  color=theme.ink_secondary, fontsize=9)
+
+    macro = data.get("macro", {})
+    beat = macro.get("folds_beating_climatology")
+    n_folds = macro.get("n_folds", len(folds))
+    tally = (f"{beat} of {n_folds} folds beat their own climatology"
+             if beat is not None else "per-fold baselines shown")
+    _title(ax, theme,
+           "Ignition risk in a province the model has never seen",
+           f"Leave-one-agency-out, one row per 10 km cell per day · {tally}")
+
+    leg = ax.legend(frameon=False, fontsize=8.5, loc="upper center",
+                    bbox_to_anchor=(0.5, -0.10 - 1.5 / n), ncol=3)
+    for t in leg.get_texts():
+        t.set_color(theme.ink_secondary)
+    _save(fig, out, theme)
+
+
+def chart_ignition_calibration(theme: Theme, out: Path):
+    """Predicted vs observed on the population scale, log-log.
+
+    Log-log for the same reason as the chart above and one more: these are
+    probabilities of order 1e-5 to 1e-2, so a linear reliability diagram is
+    four buckets stacked on the origin and one in the corner. The diagonal is
+    still the diagonal.
+
+    The gap from it is the honest headline. Ranking is what this model does
+    well; the absolute rate it emits is inherited from the seasons it was
+    fitted on, and 2025 was a quieter year than 2023.
+    """
+    res = _json("ignition_backtest.json")["result"]
+    rows = res["reliability"]
+    xs = np.array([r["mean_predicted"] for r in rows])
+    ys = np.array([r["observed_rate"] for r in rows])
+    ns = np.array([r["n"] for r in rows])
+    keep = (xs > 0) & (ys > 0)
+    xs, ys, ns = xs[keep], ys[keep], ns[keep]
+
+    fig, ax = _fig(theme, (5.4, 4.4))
+    ax.set_xscale("log"); ax.set_yscale("log")
+
+    lo = min(xs.min(), ys.min()) * 0.5
+    hi = max(xs.max(), ys.max()) * 2.0
+    ax.plot([lo, hi], [lo, hi], color=theme.muted, linewidth=1.2,
+            linestyle=(0, (4, 3)), zorder=1)
+    ax.text(hi, hi, " perfect ", color=theme.muted, fontsize=8,
+            va="center", ha="right")
+
+    prevalence = res["population_prevalence"]
+    ax.axhline(prevalence, color=theme.axis, linewidth=1.0, zorder=1)
+    ax.text(lo, prevalence, f" base rate {prevalence:.4%}", color=theme.muted,
+            fontsize=8, va="bottom", ha="left")
+
+    sizes = 34 + 110 * (ns / ns.max())
+    ax.plot(xs, ys, color=theme.series_1, linewidth=1.6, alpha=0.65, zorder=2)
+    ax.scatter(xs, ys, s=sizes, color=theme.series_1, zorder=4,
+               edgecolor=theme.surface, linewidth=1.4,
+               label="Score bucket (area = cell-days)")
+
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_xlabel("Predicted probability", color=theme.ink_secondary, fontsize=9)
+    ax.set_ylabel("Observed rate", color=theme.ink_secondary, fontsize=9)
+    _title(ax, theme,
+           "It ranks well and over-predicts by about half",
+           f"Held-out {res['test_years'][0]} season · weighted back onto the "
+           f"true cell-day rate")
+
+    leg = ax.legend(frameon=False, fontsize=8.5, loc="upper left", scatterpoints=1)
+    for t in leg.get_texts():
+        t.set_color(theme.ink_secondary)
+    for h in leg.legend_handles:
+        h.set_sizes([46])
+    _save(fig, out, theme)
+
+
 # --- driver ----------------------------------------------------------------
 
 FIGURES = {
@@ -410,6 +545,8 @@ FIGURES = {
     "pr-curve": chart_pr_curve,
     "regions": chart_regions,
     "importance": chart_importance,
+    "ignition-regions": chart_ignition_regions,
+    "ignition-calibration": chart_ignition_calibration,
 }
 
 

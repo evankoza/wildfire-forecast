@@ -64,7 +64,14 @@ NUMERIC = [
     "size_growth_to_decision",
     "size_first",
     "size_max_so_far",
-    "percent_contained",
+    # `percent_contained` is deliberately absent. The feed reports it for 0.6%
+    # of fires and with two distinct values, so LightGBM never split on it:
+    # `ablation()` measured the difference at exactly 0.0000 PR-AUC with a
+    # [0, 0] paired interval -- the two models' predictions were bit-identical.
+    # It stays in the modelling table as a diagnostic and out of the feature
+    # contract, on the same principle as `ciffc_sitrep_lag_hours`.
+    # `severity_nearest_dsr` never reached the table at all; it is nulled at
+    # ingest for the same reason and `assemble_features` does not carry it.
     "n_revisions_by_decision",
     "n_distinct_status",
     "hs_count",
@@ -573,6 +580,204 @@ def fit_final(df: pl.DataFrame, *, spec=SPEC, seed: int = 17) -> dict:
     return payload
 
 
+CIFFC_CORE = ["ciffc_national_pl", "ciffc_agency_pl"]
+
+FEATURE_SETS = {
+    "full": [],
+    "no CIFFC at all": ["ciffc"],
+    "national + agency PL only": ["ciffc_detail"],
+    "no satellite hotspots": ["hotspots"],
+    "no geography": ["geography"],
+}
+
+
+def _drop_for(groups: list[str]) -> list[str]:
+    out: list[str] = []
+    for g in groups:
+        if g == "ciffc":
+            out += [c for c in NUMERIC if c.startswith("ciffc_")]
+        elif g == "ciffc_detail":
+            out += [c for c in NUMERIC if c.startswith("ciffc_") and c not in CIFFC_CORE]
+        elif g == "hotspots":
+            out += [c for c in NUMERIC + CATEGORICAL if c.startswith("hs_")]
+        elif g == "geography":
+            out += GEOGRAPHIC
+        else:
+            raise ValueError(f"unknown feature group {g!r}")
+    return sorted(set(out))
+
+
+def ablation(
+    df: pl.DataFrame,
+    *,
+    test_years: list[int] | None = None,
+    n_boot: int = N_BOOT,
+    sets: dict[str, list[str]] | None = None,
+    seed: int = 17,
+) -> dict:
+    """Which blocks of features earn their place, paired on the same resample.
+
+    The version of this that lived in a notebook compared point estimates
+    across separately-fitted models, and the README carried the result with a
+    warning that its absolute numbers predated the determinism fix. This is
+    the same question asked properly: every variant is refit on the same
+    split, and the *difference* between two score vectors is bootstrapped over
+    the same resampled test fires.
+
+    That pairing is what makes the table readable. With ~117 positives the
+    marginal interval on any one PR-AUC swallows every other variant's point
+    estimate, so a table of marginal intervals says "no difference" whatever
+    is true. The paired difference removes the variance the two share.
+    """
+    sets = sets or FEATURE_SETS
+    years = _years(df)
+    if test_years is None:
+        test_years = [years[-1]]
+    cutoff = min(test_years)
+    train = df.filter(pl.col("fire_year") < cutoff)
+    test = df.filter(pl.col("fire_year").is_in(test_years))
+    if train.is_empty() or test.is_empty():
+        raise RuntimeError(f"empty split: train={train.height} test={test.height}")
+
+    scores: dict[str, np.ndarray] = {}
+    y = size_only = None
+    for name, groups in sets.items():
+        drop = _drop_for(groups) or None
+        fit = _fit_and_predict(train, test, drop=drop, seed=seed)
+        scores[name] = fit["p"]
+        y, size_only = fit["y_te"], fit["size_only"]
+        log.info("ablation %-26s PR-AUC %.4f", name,
+                 average_precision_score(y, fit["p"]))
+
+    reference = next(iter(sets))
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    draws = {k: [] for k in sets}
+    deltas = {k: [] for k in sets if k != reference}
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        if y[idx].sum() == 0:
+            continue
+        vals = {k: float(average_precision_score(y[idx], v[idx]))
+                for k, v in scores.items()}
+        for k, v in vals.items():
+            draws[k].append(v)
+        for k in deltas:
+            deltas[k].append(vals[k] - vals[reference])
+
+    lo, hi = PCTILES
+
+    def pct(v):
+        return [round(float(np.percentile(v, lo)), 4),
+                round(float(np.percentile(v, hi)), 4)]
+
+    rows = []
+    for name in sets:
+        row = {
+            "feature_set": name,
+            "dropped": _drop_for(sets[name]),
+            "pr_auc": round(float(average_precision_score(y, scores[name])), 4),
+            "interval": pct(draws[name]),
+        }
+        if name != reference:
+            d = np.asarray(deltas[name])
+            row["delta_vs_full"] = round(float(np.mean(d)), 4)
+            row["delta_interval"] = pct(d)
+            row["p_full_is_better"] = round(float(np.mean(d < 0)), 3)
+        rows.append(row)
+
+    out = {
+        "reference": reference,
+        "test_years": test_years,
+        "n_test": test.height,
+        "n_positives_test": int(y.sum()),
+        "pr_auc_size_only": round(float(average_precision_score(y, size_only)), 4),
+        "n_boot": len(draws[reference]),
+        "percentiles": list(PCTILES),
+        "rows": rows,
+        "trained_at": _now(),
+    }
+    dest = config.MODELS / "escalation_ablation.json"
+    dest.write_text(json.dumps(out, indent=2))
+    log.info("escalation ablation written -> %s", dest)
+    return out
+
+
+def geography_paired(
+    df: pl.DataFrame,
+    *,
+    test_years: list[int] | None = None,
+    min_test_positives: int = 10,
+    n_boot: int = N_BOOT,
+    seed: int = 17,
+) -> dict:
+    """Does dropping lat/lon/agency/region help or hurt out of region?
+
+    Runs the leave-one-agency-out backtest twice -- with geography and
+    without -- and bootstraps the difference *paired on the pooled
+    out-of-region fires*, which is the only comparison that answers the
+    question. The two runs score the same fires in the same fold order, so the
+    vectors line up row for row.
+
+    The direction of this result was never in doubt; the interval was, because
+    the figure the README carried predated the feature-determinism fix.
+    """
+    with_geo = spatial_backtest(
+        df, test_years=test_years, min_test_positives=min_test_positives,
+        drop_geography=False, n_boot=0,
+    )
+    without = spatial_backtest(
+        df, test_years=test_years, min_test_positives=min_test_positives,
+        drop_geography=True, n_boot=0,
+    )
+    if with_geo.agencies != without.agencies:
+        raise RuntimeError(
+            "the two runs kept different folds, so their pooled vectors do not "
+            f"line up: {with_geo.agencies} vs {without.agencies}"
+        )
+
+    y = with_geo.pooled_predictions["y"]
+    p_geo = with_geo.pooled_predictions["p"]
+    p_nogeo = without.pooled_predictions["p"]
+    if not np.array_equal(y, without.pooled_predictions["y"]):
+        raise RuntimeError("fold order differs between the two runs")
+
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    delta = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        if y[idx].sum() == 0:
+            continue
+        delta.append(
+            float(average_precision_score(y[idx], p_geo[idx]))
+            - float(average_precision_score(y[idx], p_nogeo[idx]))
+        )
+
+    lo, hi = PCTILES
+    out = {
+        "agencies": with_geo.agencies,
+        "n_pooled": int(n),
+        "n_positives": int(y.sum()),
+        "pr_auc_with_geography": round(float(average_precision_score(y, p_geo)), 4),
+        "pr_auc_without_geography": round(float(average_precision_score(y, p_nogeo)), 4),
+        "dropped": list(GEOGRAPHIC),
+        "paired_delta": round(float(np.mean(delta)), 4) if delta else None,
+        "percentiles": list(PCTILES),
+        "delta_interval": (
+            [round(float(np.percentile(delta, lo)), 4),
+             round(float(np.percentile(delta, hi)), 4)] if delta else None
+        ),
+        "p_geography_helps": round(float(np.mean(np.asarray(delta) > 0)), 3) if delta else None,
+        "n_boot": len(delta),
+        "trained_at": _now(),
+    }
+    dest = config.MODELS / "escalation_geography_paired.json"
+    dest.write_text(json.dumps(out, indent=2))
+    log.info("paired geography comparison written -> %s", dest)
+    return out
+
+
 def spatial_backtest(
     df: pl.DataFrame,
     *,
@@ -745,4 +950,10 @@ def spatial_backtest(
     out = config.MODELS / f"escalation_spatial_backtest{tag}.json"
     out.write_text(json.dumps({"spec": asdict(spec), "result": asdict(res)}, indent=2))
     log.info("spatial backtest written -> %s", out)
+
+    # The pooled score vectors, in fold order, for callers that need to pair
+    # two runs against each other. Attached rather than declared as a field so
+    # that `asdict(res)` -- which is what writes the JSON above -- never sees
+    # a numpy array.
+    res.pooled_predictions = {"y": y_all, "p": p_all, "size_only": s_all}
     return res

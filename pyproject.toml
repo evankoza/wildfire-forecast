@@ -26,7 +26,10 @@ dependencies = [
 
 [project.optional-dependencies]
 scrape = ["playwright>=1.44"]
-dev = ["pytest>=8.0"]
+# The HTTP layer is optional so that a clone that only wants to run the
+# backtest does not acquire a web framework it never imports.
+serve = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8.0", "fastapi>=0.110"]
 
 [project.scripts]
 wildfire = "wildfire.cli:app"

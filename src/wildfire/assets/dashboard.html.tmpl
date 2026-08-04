@@ -1,3 +1,5 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wildfire Escalation Watch</title>
 
 <style>
@@ -242,7 +244,14 @@
   .block > .lede {
     margin: 0 0 20px; color: var(--ink-2); font-size: 15px; max-width: 68ch;
   }
-  .charts { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+  /* 430px, not 330: there are four charts, and at 330 a 1240px page fits three
+     across and orphans the fourth on its own row. 430 forces a 2x2 block, which
+     also renders each figure near its native width instead of downscaled.
+     The min() is load-bearing -- a bare minmax(430px, 1fr) cannot shrink below
+     its floor, so on any viewport narrower than the floor the track overflows
+     the page instead of reflowing. min(430px, 100%) collapses it to the
+     container on phones. */
+  .charts { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(min(430px, 100%), 1fr)); }
   figure.chart { margin: 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 3px; padding: 10px; }
   figure.chart img { width: 100%; height: auto; display: block; border-radius: 2px; }
   figure.chart img.dk { display: none; }
@@ -335,6 +344,13 @@
   .foot-note { margin: 0; color: var(--ink-2); }
   footer.foot a { color: var(--ink-2); }
 
+  /* Once the masthead wraps, the stamp sits under the title rather than beside
+     it, and a right-aligned block under a left-aligned h1 reads as a mistake. */
+  @media (max-width: 620px) {
+    .asof { text-align: left; }
+    .masthead { gap: 14px; padding-top: 22px; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
   }
@@ -364,6 +380,7 @@
           <button class="chip" data-band="elevated" aria-pressed="false">&ge;&thinsp;10%</button>
           <button class="chip" data-band="high" aria-pressed="false">&ge;&thinsp;25%</button>
           <select id="agency" aria-label="Filter by agency"></select>
+          <button class="chip" id="ignition-toggle" aria-pressed="true" hidden>Ignition risk</button>
         </div>
       </header>
       <div class="mapwrap">
@@ -375,6 +392,13 @@
         <span class="sw"><i style="background:var(--sev-1)"></i> 10&ndash;25%</span>
         <span class="sw"><i style="background:var(--sev-0)"></i> below 10%</span>
         <span style="margin-left:auto">circle area &prop; hectares burned to date</span>
+      </div>
+      <div class="legend" id="ignition-legend" hidden>
+        <span class="sw"><i style="background:var(--sev-2);opacity:.55"></i> highest 0.5% of cells</span>
+        <span class="sw"><i style="background:var(--sev-1);opacity:.5"></i> next 1.5%</span>
+        <span class="sw"><i style="background:var(--sev-0);opacity:.45"></i> next 6%</span>
+        <span>10&thinsp;km cells, drawn a little larger than scale to be visible</span>
+        <span style="margin-left:auto" id="ignition-note"></span>
       </div>
     </div>
 
@@ -404,9 +428,9 @@
   <section class="block">
     <h2>Does it work</h2>
     <p class="lede">
-      The model is scored the hard way: on seasons and regions it was never
-      trained on, always against the only baseline that matters &mdash; how big
-      the fire already is.
+      The model gets scored the hard way: on seasons and regions it never
+      trained on, and always against the only baseline that matters&hellip;
+      how big the fire already is.
     </p>
     <div class="charts" id="charts"></div>
   </section>
@@ -552,6 +576,31 @@
 
   var hoverIdx = -1, visible = new Uint8Array(D.fires.length).fill(1);
 
+  /* ---- ignition layer -------------------------------------------------
+     A second model on a different unit: probability that a new fire is
+     reported in a 10 km cell today. Projected once, painted underneath the
+     fires, and deliberately NOT hit-tested -- the fires are what a reader
+     hovers, and adding 2,000 more candidates to a per-move linear scan is
+     how the hover got slow the first time.
+
+     The squares are sized from the projection at their own latitude rather
+     than a single constant, because this map is conformal: a 10 km cell is
+     visibly larger on screen in Nunavut than on the 49th parallel, and the
+     grid underneath is equal-area, so a constant size would show a false
+     gradient. --------------------------------------------------------- */
+  var ign = D.ignition || null;
+  var ignPts = [];
+  if (ign) {
+    ignPts = ign.cells.map(function (c) {
+      var q = project(c[1], c[0]);
+      /* Half a cell north, so the on-screen size follows the projection's
+         local scale. 0.045 degrees of latitude is about 5 km. */
+      var q2 = project(c[1], c[0] + 0.045);
+      return { x: q[0], y: q[1], h: Math.abs(q2[1] - q[1]), band: c[2] };
+    });
+  }
+  var showIgnition = ignPts.length > 0;
+
   function draw() {
     ctx.clearRect(0, 0, W, H);
 
@@ -567,6 +616,22 @@
       ctx.closePath();
       ctx.fill();
       ctx.stroke();
+    }
+
+    if (showIgnition) {
+      var ALPHA = [0.55, 0.5, 0.45];
+      for (var c = 0; c < ignPts.length; c++) {
+        var p = ignPts[c];
+        /* Canada is ~5,500 km across and this map is ~600 px wide, so a true
+           10 km cell is barely one pixel and the layer reads as dust. The
+           floor is a legibility choice, not a scale error, and the legend
+           says so. */
+        var half = Math.max(p.h * scale, 1.9);
+        ctx.globalAlpha = ALPHA[p.band];
+        ctx.fillStyle = PAL.sev[p.band];
+        ctx.fillRect(sx(p.x) - half, sy(p.y) - half, half * 2, half * 2);
+      }
+      ctx.globalAlpha = 1;
     }
 
     ctx.font = '600 9px ' + tok("--mono");
@@ -728,16 +793,35 @@
   }
 
   /* ---- interactions --------------------------------------------------- */
-  document.querySelectorAll(".chip").forEach(function (b) {
+  /* `[data-band]`, not `.chip`: the ignition toggle is a chip too, and it is
+     an independent switch rather than a member of this radio group. Selecting
+     on the class turned it into a fourth band filter that cleared the other
+     three. */
+  document.querySelectorAll(".chip[data-band]").forEach(function (b) {
     b.addEventListener("click", function () {
       band = b.dataset.band;
-      document.querySelectorAll(".chip").forEach(function (o) {
+      document.querySelectorAll(".chip[data-band]").forEach(function (o) {
         o.setAttribute("aria-pressed", String(o === b));
       });
       render();
     });
   });
   sel.addEventListener("change", function () { agency = sel.value; render(); });
+
+  if (ign) {
+    var igBtn = $("ignition-toggle"), igLeg = $("ignition-legend");
+    igBtn.hidden = false;
+    igLeg.hidden = false;
+    $("ignition-note").textContent =
+      ign.n_shown.toLocaleString("en-CA") + " of " +
+      ign.n_cells.toLocaleString("en-CA") + " cells \u00b7 " + ign.day;
+    igBtn.addEventListener("click", function () {
+      showIgnition = !showIgnition;
+      igBtn.setAttribute("aria-pressed", String(showIgnition));
+      igLeg.hidden = !showIgnition;
+      draw();
+    });
+  }
 
   document.querySelectorAll("thead th").forEach(function (th) {
     th.querySelector("button").addEventListener("click", function () {

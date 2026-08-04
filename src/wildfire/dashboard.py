@@ -54,50 +54,89 @@ CHART_META = [
     ("importance", "Feature importance by LightGBM split gain.",
      "Distance to the nearest satellite detection and how long orbit saw the "
      "fire before the ground reported it both outrank its reported size."),
+    ("ignition-regions", "Ignition model, leave-one-agency-out, on a log axis, "
+                         "against a fire-weather and a climatology baseline.",
+     "The second model, in provinces it has never seen. All eleven folds beat "
+     "both baselines. The log axis is forced by the data: a cell in the "
+     "Yukon's short intense season is a hundred times likelier to report a "
+     "fire than one on the Nova Scotia coast."),
+    ("ignition-calibration", "Ignition reliability, predicted against observed, "
+                             "on log-log axes.",
+     "The honest weakness. The ranking is good; the absolute rate runs about "
+     "1.7x high, because it is calibrated to seasons that burned harder than "
+     "the one it was tested on."),
 ]
 
 METHOD_HTML = """
-<p>A fire enters Canada's national reporting feed. Twenty-four hours later this
-model asks one question: <b>will it be a large fire &mdash; 100 hectares or
-more &mdash; three days after it was first reported?</b></p>
+<p>Two models, on two different units of ground truth.</p>
+<dl class="kv">
+  <dt>Escalation</dt><dd>A fire enters Canada's national reporting feed. Twenty-four hours later: <b>will it be a large fire, 100 hectares or more, three days after it was first reported?</b> That is what the map and the watchlist above are showing.</dd>
+  <dt>Ignition</dt><dd>Standing at midnight over a 10&nbsp;km cell of ground: <b>will a new fire be reported there today?</b> That is the orange wash under the map.</dd>
+</dl>
 
 <h3>Why the timing is the whole problem</h3>
-<p>The obvious way to build this is also the wrong one. Fire records are
+<p>The obvious way to build this is also the wrong one. Fire records get
 revised constantly: a fire logged at 0.1&nbsp;ha on Monday reads 4,000&nbsp;ha
 by Thursday, in the same row. Train on the current state of the table and the
 model learns from numbers that did not exist when the forecast would have been
-made, then collapses in production.</p>
-<p>What makes this tractable is that the national feed is <b>bitemporal</b>.
-Every fire carries many revisions, each stamped with the window during which it
-was the system's current belief. So &ldquo;what was known at 24&nbsp;hours&rdquo;
-is a filter, not a reconstruction &mdash; and point-in-time correctness stops
-being a matter of discipline and becomes a property of the query.</p>
+made, then falls apart in production.</p>
+<p>What saves it is that the national feed is <b>bitemporal</b>. Every fire
+carries many revisions, each stamped with the window during which it was the
+system's current belief. So &ldquo;what was known at 24&nbsp;hours&rdquo; is a
+filter, not a reconstruction&hellip; point-in-time correctness stops being a
+matter of discipline and becomes a property of the query.</p>
 
 <h3>What it reads</h3>
 <dl class="kv">
-  <dt>Fire state</dt><dd>Reported size, control status, cause and response type, as they stood at the 24&nbsp;hour mark &mdash; plus how many times the agency had already revised the record, which is a good proxy for how worried they were.</dd>
+  <dt>Fire state</dt><dd>Reported size, control status, cause and response type, as they stood at the 24&nbsp;hour mark. Plus how many times the agency had already revised the record, which is a good proxy for how worried they were.</dd>
   <dt>Satellite</dt><dd>Hotspot detections within 10&nbsp;km, already carrying Canadian fire-behaviour outputs: head fire intensity, rate of spread, fuel type. The strongest single signal is how long orbit saw the fire <em>before</em> anyone reported it.</dd>
-  <dt>Context</dt><dd>Location, day of year, and the agency's own preparedness level that day &mdash; the last of which, measured honestly, turned out not to help.</dd>
+  <dt>Context</dt><dd>Location, day of year, and the agency's own preparedness level that day. That last one, measured honestly, turned out not to help &mdash; on either model.</dd>
+  <dt>Fire weather</dt><dd>For ignition only: noon readings from ~2,250 weather stations, interpolated to each cell. The hotspot feed carries fire weather too, but only where something was <em>already</em> burning &mdash; which would be circular evidence for where a fire is about to start.</dd>
 </dl>
 
-<h3>How it is checked</h3>
-<p>Two blocks, because one is not enough. Holding out a <b>season</b> shows it
-works on a year it never saw. Holding out a <b>region</b> &mdash; dropping an
-entire province from training and testing only there &mdash; shows it learned
-fire behaviour rather than memorising Alberta. Doing both at once is the
-strictest split the data supports, and it agrees.</p>
-<p>Every figure is reported against a size-at-decision baseline, because a
-model that cannot beat &ldquo;how big is it already&rdquo; has learned nothing
-worth deploying, and with intervals, because 117 escalations is not many.</p>
+<h3>The second model has three problems the first one does not</h3>
+<p><b>The unit has to be invented.</b> A fire arrives with its own coordinates;
+a non-event does not. So: a 10&nbsp;km <em>equal-area</em> grid, not the
+conformal projection this map is drawn in. Conformal cells grow with latitude,
+and the label would then quietly mean something different at every parallel.</p>
+<p><b>The domain has to be bounded.</b> Canada is about a million cells and
+almost all of them are ice or tundra where nothing has ever burned. The model
+is only asked about cells that showed some fire activity in the seasons it
+trained on&hellip; which leaves 11% of the next season's fires outside the
+question entirely, and that number is reported rather than buried.</p>
+<p><b>One cell-day in a thousand carries an ignition.</b> So the training panel
+keeps every one of those and a 3% sample of the quiet days &mdash; then has to
+undo that twice. Once on the probabilities, which the sampling inflates by a
+known factor. Once on the accuracy score itself, which is a function of how
+rare the event is: unweighted, this model reads about 0.30, and the honest
+figure is 0.019.</p>
 
-<h3>What it does not do</h3>
-<p>It does not know about terrain, roads, values at risk, or what crews are
-actually doing. It cannot see a fire no one has reported yet. The scores are
-coarse by construction &mdash; calibration produces about 26 distinct values, so
-this is a shortlist, not a ranking, and small differences between adjacent rows
-carry no information. And the model scoring the fires above was fitted on every
-completed season, so its accuracy is <em>inferred</em> from the held-out tests,
-never directly measured on these fires.</p>
+<h3>How they are checked</h3>
+<p>Two blocks, because one is not enough. Holding out a <b>season</b> shows it
+works on a year it never saw. Holding out a <b>region</b>, dropping an entire
+province from training and testing only there, shows it learned fire behaviour
+rather than memorising Alberta. Doing both at once is the strictest split the
+data supports, and both models agree under it.</p>
+<p>Every figure is reported against a baseline someone already has: for
+escalation, how big the fire is already; for ignition, the fire weather map and
+the knowledge of where fires keep starting. And with intervals, because 117
+escalations is not many. Whether a block of features earns its place is settled
+by refitting without it and bootstrapping the difference on the same resample
+&mdash; which is how three separate things here turned out to contribute
+nothing.</p>
+
+<h3>What they do not do</h3>
+<p>Neither knows about terrain, roads, values at risk, or what crews are
+actually doing. Neither can see lightning: the national strike network is not
+public, and for ignition that is the largest single gap.</p>
+<p>The escalation scores are coarse on purpose &mdash; calibration produces
+about 26 distinct values, so this is a shortlist, not a ranking. The ignition
+scores are worse than coarse: they rank well and run about 1.7&times; high in
+absolute terms, because the rate is inherited from seasons that burned harder
+than the one it was tested on. Read the order, not the number.</p>
+<p>And both models scoring this page were fitted on every completed season, so
+their accuracy is <em>inferred</em> from the held-out tests, never directly
+measured on what you are looking at.</p>
 """
 
 
@@ -114,7 +153,7 @@ all</b>. The NRCan feeds below are published through the
   <tbody>
     <tr>
       <td><a href="https://geoserver.cwfif.nrcan.gc.ca/geoserver/wfs?service=WFS&amp;version=2.0.1&amp;request=GetCapabilities">CWFIF national GeoServer</a><span class="src-note">NRCan &middot; WFS</span></td>
-      <td>Every reported fire with its full revision history &mdash; size, control status, cause, response type. The bitemporal stamps on these records are what make an honest forecast possible.</td>
+      <td>Every reported fire with its full revision history: size, control status, cause, response type. The bitemporal stamps on these records are what make an honest forecast possible.</td>
       <td class="yes">Fire state and the label</td>
     </tr>
     <tr>
@@ -123,18 +162,23 @@ all</b>. The NRCan feeds below are published through the
       <td class="yes">The strongest features</td>
     </tr>
     <tr>
+      <td><a href="https://cwfis.cfs.nrcan.gc.ca/downloads/fwi_obs/">CWFIS station weather &amp; FWI</a><span class="src-note">NRCan &middot; decadal archive + daily</span></td>
+      <td>Noon-local readings from ~2,250 stations: temperature, humidity, wind, rain and all six Fire Weather Index System codes &mdash; taken whether or not anything nearby is burning, which is the whole point.</td>
+      <td class="yes">The ignition model's only exogenous input</td>
+    </tr>
+    <tr>
       <td><a href="https://www.naturalearthdata.com/">Natural Earth</a></td>
-      <td>Provincial and territorial boundaries, simplified from 705&nbsp;KB to 23&nbsp;KB so the page carries its own basemap.</td>
-      <td class="yes">This map</td>
+      <td>Provincial and territorial boundaries, simplified from 705&nbsp;KB to 23&nbsp;KB so the page carries its own basemap. Also the country filter for the ignition grid.</td>
+      <td class="yes">This map, and the study area</td>
     </tr>
     <tr>
       <td><a href="https://ciffc.net/situation/">CIFFC situation report</a><span class="src-note">via <a href="https://api.ciffc.net/v1/sitrep">api.ciffc.net/v1/sitrep</a></span></td>
-      <td>National and per-agency preparedness levels &mdash; the human judgement about how stretched crews and aircraft are. No machine feed produces this.</td>
+      <td>National and per-agency preparedness levels. The human judgement about how stretched crews and aircraft are, which no machine feed produces.</td>
       <td class="null">Ingested. Measured effect: none</td>
     </tr>
     <tr>
       <td><a href="https://open-meteo.com/en/docs/historical-weather-api">Open-Meteo ERA5 archive</a></td>
-      <td>Hourly reanalysis weather &mdash; temperature, humidity, wind, gusts, precipitation &mdash; back to 1940. No key required.</td>
+      <td>Hourly reanalysis weather back to 1940: temperature, humidity, wind, gusts, precipitation. No key required.</td>
       <td class="spare">Already covered by hotspot FWI</td>
     </tr>
     <tr>
@@ -150,26 +194,33 @@ all</b>. The NRCan feeds below are published through the
 
 <p><b>CIFFC preparedness is a result, not a gap.</b> It is ingested, backfilled
 to 2019, and joined onto 98.5% of fires with a point-in-time-safe as-of join on
-publication time. Its effect on escalation was then measured at +0.002 PR-AUC,
-with an interval straddling zero. The likely reason is structural: preparedness
-is one value per agency per day, so every fire burning in one province that day
-shares it &mdash; and day-of-year plus agency already encode most of that
-seasonal-and-regional load pattern. It stays ingested because an
-agency-and-day covariate is exactly the right shape for the ignition model,
-where the unit of prediction is a grid cell and a day. Reporting it as helpful
-would be easier and false.</p>
+publication time. Measured on escalation with a paired bootstrap, dropping the
+whole block <em>gains</em> 0.011 PR-AUC, with an interval straddling zero: no
+detectable benefit.</p>
+<p>The defence used to be that it was simply the wrong shape &mdash; one value
+per agency per day, so every fire burning in one province that day shares it,
+and day-of-year plus agency already encode most of that seasonal load pattern.
+An agency-and-day covariate ought to suit a model whose unit of prediction
+<em>is</em> a cell and a day. So it was re-tested there, on the ignition model,
+where the sitrep even carries each agency's own forecast of tomorrow's
+lightning- and human-caused ignition load &mdash; very nearly this model's
+target, written down by a human. It did nothing there either. Reporting it as
+helpful would be easier and false.</p>
 
 <p><b>Open-Meteo would mostly repeat what the hotspots already carry.</b> Every
 satellite detection arrives with the Fire Weather Index computed at that pixel,
 and FWI is precisely a compression of the drought, wind and humidity history
 that ERA5 would supply. So the marginal gain is unproven, while the cost is one
-request per grid cell per date window &mdash; thousands per season against a
+request per grid cell per date window, thousands per season against a
 free public service. The client is built and a flag turns it on; the experiment
 to show it earns that cost has not been run, and until it has, leaving it off
-is the honest default rather than the lazy one.</p>
+is the honest default rather than the lazy one. The station-weather result on
+the ignition model &mdash; a real, non-circular fire-weather feed worth about a
+thousandth of a PR-AUC once the model already knows where and when &mdash;
+suggests what that experiment will find.</p>
 
 <p><b>NASA FIRMS is a strict subset here.</b> It publishes raw detections from
-the same satellites CWFIS uses &mdash; VIIRS and MODIS &mdash; but NRCan ships
+the same satellites CWFIS uses, VIIRS and MODIS, but NRCan ships
 them already enriched with Canadian Fire Behaviour Prediction outputs: head fire
 intensity, rate of spread, fuel type, fuel consumption. Using FIRMS instead
 would mean re-deriving fire science that has already been done properly. It
@@ -190,11 +241,60 @@ def _fires() -> pl.DataFrame:
     return pl.read_parquet(path)
 
 
-def _readouts(df: pl.DataFrame, meta: dict) -> list[dict]:
+# How many scored cells reach the map. All 26,000 would paint as a solid wash
+# over the whole boreal, which says nothing; the point of the layer is where
+# today is unusual. The threshold is a quantile rather than an absolute score
+# because the model's scale drifts with the season it was fitted on.
+IGNITION_TOP_FRACTION = 0.08
+IGNITION_BANDS = (0.995, 0.98)  # quantiles for the two darker bands
+
+
+def _ignition() -> dict | None:
+    """The scored ignition grid, thinned for the map.
+
+    Returns None when the model has not been run, because the escalation half
+    of this page has to keep working on its own -- the two are refreshed by
+    different commands against different feeds, and one being stale is normal.
+    """
+    path = config.MODELS / "ignition_risk.parquet"
+    if not path.exists():
+        log.info("no ignition scores - the risk layer will be absent")
+        return None
+
+    df = pl.read_parquet(path)
+    if df.is_empty():
+        return None
+    day = df["day"].max()
+    df = df.filter(pl.col("day") == day).sort("risk", descending=True)
+
+    n_cells = df.height
+    keep = max(1, int(n_cells * IGNITION_TOP_FRACTION))
+    cut = df["risk"].quantile(IGNITION_BANDS[0]), df["risk"].quantile(IGNITION_BANDS[1])
+    top = df.head(keep)
+
+    cells = [
+        [
+            round(r["lat"], 3),
+            round(r["lon"], 3),
+            0 if r["risk"] >= cut[0] else 1 if r["risk"] >= cut[1] else 2,
+        ]
+        for r in top.iter_rows(named=True)
+    ]
+    return {
+        "day": str(day),
+        "n_cells": n_cells,
+        "n_shown": len(cells),
+        "cells": cells,
+        "top_risk": round(float(df["risk"].max()), 4),
+        "share": round(100 * len(cells) / n_cells, 1),
+    }
+
+
+def _readouts(df: pl.DataFrame, meta: dict, ignition: dict | None) -> list[dict]:
     high = df.filter(pl.col("risk") >= 0.25).height
     elev = df.filter(pl.col("risk") >= 0.10).height
     oc = df.filter(pl.col("status_now") == "OC").height
-    return [
+    out = [
         {"k": "Fires scored", "v": f"{df.height:,}",
          "s": "first reported in the last 21 days"},
         {"k": "Flagged elevated", "v": f"{elev:,}", "tone": "sev1" if elev else "",
@@ -204,6 +304,13 @@ def _readouts(df: pl.DataFrame, meta: dict) -> list[dict]:
         {"k": "Out of control now", "v": f"{oc:,}",
          "s": "agency-reported status"},
     ]
+    if ignition:
+        out.append({
+            "k": "Cells scored for ignition",
+            "v": f"{ignition['n_cells']:,}",
+            "s": f"10 km cells, {ignition['day']}",
+        })
+    return out
 
 
 def build(*, out: Path | None = None, top_map: int | None = None) -> Path:
@@ -252,12 +359,14 @@ def build(*, out: Path | None = None, top_map: int | None = None) -> Path:
             for name, alt, caption in CHART_META
         ]
 
+    payload_ignition = _ignition()
     payload = {
         "meta": meta,
         "fires": fires,
+        "ignition": payload_ignition,
         "provinces": json.loads(PROVINCES.read_text(encoding="utf-8")),
         "labels": LABELS,
-        "readouts": _readouts(df, meta),
+        "readouts": _readouts(df, meta, payload_ignition),
         "charts": charts,
         "method": METHOD_HTML,
         "sources": SOURCES_HTML,
